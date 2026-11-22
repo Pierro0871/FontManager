@@ -10,8 +10,16 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install pyinstaller pillow rarfile
+      - run: python test_polices.py
+      - name: Numéro de version
+        shell: bash
+        run: sed -i 's/^VERSION = "dev"/VERSION = "1.${{ github.run_number }}"/' polices.py && grep '^VERSION' polices.py
       - run: pyinstaller --onefile --windowed --name GestionnairePolices polices.py
       - uses: actions/upload-artifact@v4
         with: { name: GestionnairePolices, path: dist/GestionnairePolices.exe }
       - uses: softprops/action-gh-release@v2
-        with: { tag_name: latest, name: GestionnairePolices, files: dist/GestionnairePolices.exe }
+        with:
+          tag_name: v1.${{ github.run_number }}
+          name: Gestionnaire de polices v1.${{ github.run_number }}
+          make_latest: true
+          files: dist/GestionnairePolices.exe

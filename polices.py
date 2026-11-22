@@ -35,7 +35,46 @@ else:  # pour tester sous Linux/Mac
 
 REG_PATH = r"Software\Microsoft\Windows NT\CurrentVersion\Fonts"
 ROW_H = 64
-BG, FG, ACC, SEL = "#ffffff", "#1e1e1e", "#2f6fde", "#dce8ff"
+VERSION = "dev"  # remplacé par le build GitHub (ex. 1.12)
+REPO = "Pierro0871/FontManager"
+THEMES = {
+    "clair": dict(BG="#ffffff", FG="#1e1e1e", ACC="#2f6fde", SEL="#dce8ff", BAR="#f3f4f6", MUTED="#666666", LINE="#e6e6e6", FIELD="#ffffff"),
+    "sombre": dict(BG="#1e1f22", FG="#e6e6e6", ACC="#4c8dff", SEL="#2d3f63", BAR="#2b2d31", MUTED="#9a9a9a", LINE="#3a3c41", FIELD="#383a40"),
+}
+BG = FG = ACC = SEL = BAR = MUTED = LINE = FIELD = ""
+
+
+def set_theme(name):
+    globals().update(THEMES.get(name, THEMES["clair"]))
+
+
+set_theme("clair")
+
+
+def parse_version(v):
+    """'1.12' -> (1, 12) ; 'v1.12' accepté ; 'dev' -> None."""
+    try:
+        return tuple(int(x) for x in v.lstrip("v").split("."))
+    except ValueError:
+        return None
+
+
+def latest_release():
+    import urllib.request
+    req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                 headers={"User-Agent": "GestionnairePolices"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        d = json.load(r)
+    url = next((a["browser_download_url"] for a in d.get("assets", []) if a["name"].endswith(".exe")), None)
+    return d.get("tag_name", ""), url
+
+
+def find_duplicates(fonts):
+    """Polices présentes en plusieurs fichiers (même famille + style)."""
+    count = {}
+    for f in fonts:
+        count[(f.family.lower(), f.style.lower())] = count.get((f.family.lower(), f.style.lower()), 0) + 1
+    return {f.path for f in fonts if count[(f.family.lower(), f.style.lower())] > 1}
 
 
 # ---------------------------------------------------------------- polices
@@ -182,6 +221,7 @@ class App(tk.Tk):
         self.minsize(800, 500)
         self.configure(bg=BG)
         self.cfg = self.load_cfg()
+        set_theme(self.cfg.get("theme", "clair"))
         self.fonts, self.view = [], []
         self.cache = {}
         self.sel = set()
@@ -199,6 +239,7 @@ class App(tk.Tk):
         for v in (self.search, self.filter, self.sort):
             v.trace_add("write", lambda *_: self.apply_filter())
         self.reload()
+        self.after(2500, lambda: self.check_update(True))
 
     # -- config
     def load_cfg(self):
@@ -226,9 +267,17 @@ class App(tk.Tk):
     def build_ui(self):
         st = ttk.Style(self)
         st.theme_use("clam")
-        st.configure("TButton", padding=(10, 5))
+        self.configure(bg=BG)
+        st.configure(".", background=BG, foreground=FG, fieldbackground=FIELD, bordercolor=LINE,
+                     troughcolor=BAR, arrowcolor=FG, lightcolor=BAR, darkcolor=BAR)
+        st.configure("TButton", padding=(10, 5), background=BAR, foreground=FG)
+        st.map("TButton", background=[("active", LINE)])
         st.configure("Accent.TButton", background=ACC, foreground="white")
-        st.map("Accent.TButton", background=[("active", "#1f56b8")])
+        st.map("Accent.TButton", background=[("active", ACC)])
+        st.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)])
+        st.configure("TEntry", insertcolor=FG)
+        self.option_add("*TCombobox*Listbox.background", FIELD)
+        self.option_add("*TCombobox*Listbox.foreground", FG)
 
         top = tk.Frame(self, bg=BG, padx=10, pady=8)
         top.pack(fill="x")
@@ -237,27 +286,32 @@ class App(tk.Tk):
         ttk.Button(top, text="⭐ Favori", command=self.toggle_fav).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="🗑 Désinstaller", command=self.uninstall_sel).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="📂 Ouvrir le dossier", command=self.open_folder).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="💾 Exporter…", command=self.export_sel).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="⟳", width=3, command=self.reload).pack(side="left", padx=(8, 0))
-        self.count = tk.Label(top, bg=BG, fg="#666")
+        ttk.Button(top, text="🌙" if self.cfg.get("theme") != "sombre" else "☀", width=3,
+                   command=self.toggle_theme).pack(side="right", padx=(8, 0))
+        ttk.Button(top, text="⬆ Mise à jour", command=lambda: self.check_update(False)).pack(side="right", padx=(8, 0))
+        tk.Label(top, text=f"v{VERSION}", bg=BG, fg=MUTED).pack(side="right", padx=(8, 0))
+        self.count = tk.Label(top, bg=BG, fg=MUTED)
         self.count.pack(side="right")
 
-        bar = tk.Frame(self, bg="#f3f4f6", padx=10, pady=8)
+        bar = tk.Frame(self, bg=BAR, padx=10, pady=8)
         bar.pack(fill="x")
-        tk.Label(bar, text="Texte :", bg="#f3f4f6").pack(side="left")
+        tk.Label(bar, text="Texte :", bg=BAR, fg=FG).pack(side="left")
         ttk.Entry(bar, textvariable=self.sample, width=40).pack(side="left", padx=(4, 12))
-        tk.Label(bar, text="Taille :", bg="#f3f4f6").pack(side="left")
+        tk.Label(bar, text="Taille :", bg=BAR, fg=FG).pack(side="left")
         ttk.Scale(bar, from_=10, to=72, variable=self.size, length=120,
                   command=lambda v: self.size.set(int(float(v)))).pack(side="left", padx=4)
-        tk.Label(bar, textvariable=self.size, bg="#f3f4f6", width=3).pack(side="left", padx=(0, 12))
-        tk.Label(bar, text="🔍", bg="#f3f4f6").pack(side="left")
+        tk.Label(bar, textvariable=self.size, bg=BAR, fg=FG, width=3).pack(side="left", padx=(0, 12))
+        tk.Label(bar, text="🔍", bg=BAR, fg=FG).pack(side="left")
         ttk.Entry(bar, textvariable=self.search, width=18).pack(side="left", padx=(2, 12))
         ttk.Combobox(bar, textvariable=self.filter, state="readonly", width=16,
-                     values=["Toutes", "Favoris", "Installées par moi", "Système"]).pack(side="left")
-        tk.Label(bar, text=" Tri :", bg="#f3f4f6").pack(side="left")
+                     values=["Toutes", "Favoris", "Installées par moi", "Système", "Doublons"]).pack(side="left")
+        tk.Label(bar, text=" Tri :", bg=BAR, fg=FG).pack(side="left")
         ttk.Combobox(bar, textvariable=self.sort, state="readonly", width=10,
                      values=["Nom", "Type", "Fichier", "Taille"]).pack(side="left", padx=4)
 
-        body = tk.PanedWindow(self, orient="horizontal", sashwidth=5, bg="#ddd")
+        body = tk.PanedWindow(self, orient="horizontal", sashwidth=5, bg=LINE)
         body.pack(fill="both", expand=True)
 
         left = tk.Frame(body, bg=BG)
@@ -271,7 +325,7 @@ class App(tk.Tk):
         right = tk.Frame(body, bg=BG, padx=14, pady=10)
         self.d_title = tk.Label(right, bg=BG, fg=FG, font=("Segoe UI", 14, "bold"), anchor="w", wraplength=330, justify="left")
         self.d_title.pack(fill="x")
-        self.d_info = tk.Label(right, bg=BG, fg="#666", anchor="w", justify="left", wraplength=330)
+        self.d_info = tk.Label(right, bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=330)
         self.d_info.pack(fill="x", pady=(2, 8))
         self.d_img = tk.Label(right, bg=BG, anchor="nw")
         self.d_img.pack(fill="both", expand=True)
@@ -289,6 +343,7 @@ class App(tk.Tk):
         self.bind("<Next>", lambda e: self.move(8))
         self.bind("<Delete>", lambda e: self.uninstall_sel() if self.focus_get() == self.canvas or not isinstance(self.focus_get(), ttk.Entry) else None)
         self.bind("<f>", lambda e: None if isinstance(self.focus_get(), ttk.Entry) else self.toggle_fav())
+        self.bind("<Control-c>", lambda e: None if isinstance(self.focus_get(), ttk.Entry) else self.copy_names())
         self.protocol("WM_DELETE_WINDOW", lambda: (self.save_cfg(), self.destroy()))
 
     # -- données
@@ -315,6 +370,9 @@ class App(tk.Tk):
             v = [x for x in v if x.user]
         elif f == "Système":
             v = [x for x in v if not x.user]
+        elif f == "Doublons":
+            dups = find_duplicates(self.fonts)
+            v = [x for x in v if x.path in dups]
         key = {"Nom": lambda x: x.name.lower(),
                "Type": lambda x: (x.ext, x.name.lower()),
                "Fichier": lambda x: os.path.basename(x.path).lower(),
@@ -372,21 +430,22 @@ class App(tk.Tk):
             fi, y = self.view[i], i * rh
             if fi.path in self.sel:
                 c.create_rectangle(0, y, w, y + rh, fill=SEL, width=0)
-            c.create_line(0, y + rh - 1, w, y + rh - 1, fill="#eee")
+            c.create_line(0, y + rh - 1, w, y + rh - 1, fill=LINE)
             star = "⭐ " if self.is_fav(fi) else ""
             tag = "" if fi.user else "  · système"
             c.create_text(12, y + 6, anchor="nw", text=f"{star}{fi.name}{tag}",
-                          fill="#666", font=("Segoe UI", 9))
+                          fill=MUTED, font=("Segoe UI", 9))
             c.create_image(12, y + 22, anchor="nw", image=self.render(fi, text, size, w - 24))
         if not self.view:
-            c.create_text(w // 2, 60, text="Aucune police", fill="#888", font=("Segoe UI", 12))
+            c.create_text(w // 2, 60, text="Aucune police", fill=MUTED, font=("Segoe UI", 12))
 
     def show_detail(self):
         fi = next((x for x in self.view if x.path == self.anchor), None)
         if not fi:
             self.d_title.config(text="Sélectionnez une police")
             self.d_info.config(text="Clic = sélection · Ctrl/Maj+clic = multi-sélection\n"
-                                    "Double-clic ou F = favori · Suppr = désinstaller")
+                                    "Double-clic ou F = favori · Suppr = désinstaller\n"
+                                    "Ctrl+C = copier le nom · filtre Doublons = fichiers en double")
             self.d_img.config(image="")
             return
         try:
@@ -533,6 +592,82 @@ class App(tk.Tk):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def toggle_theme(self):
+        self.cfg["theme"] = "clair" if self.cfg.get("theme") == "sombre" else "sombre"
+        set_theme(self.cfg["theme"])
+        self.save_cfg()
+        for w in self.winfo_children():
+            w.destroy()
+        self.cache.clear()
+        self.build_ui()
+        self.apply_filter()
+
+    def copy_names(self):
+        sel = self.selected()
+        if sel:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(x.family for x in sel))
+            self.count.config(text=f"{len(sel)} nom(s) copié(s)")
+
+    def export_sel(self):
+        sel = self.selected() or self.view
+        if not sel:
+            return
+        dest = filedialog.askdirectory(title=f"Copier {len(sel)} fichier(s) police dans…")
+        if not dest:
+            return
+        n = 0
+        for x in sel:
+            try:
+                shutil.copy2(x.path, dest)
+                n += 1
+            except OSError:
+                pass
+        messagebox.showinfo("Export", f"{n} fichier(s) copié(s) dans\n{dest}")
+
+    def check_update(self, silent):
+        cur = parse_version(VERSION)
+        if not getattr(sys, "frozen", False) or cur is None:
+            if not silent:
+                messagebox.showinfo("Mise à jour", "Mise à jour automatique disponible seulement dans l'exe.")
+            return
+        def work():
+            try:
+                tag, url = latest_release()
+            except Exception as e:
+                if not silent:
+                    self.after(0, lambda: messagebox.showerror("Mise à jour", f"Pas de connexion à GitHub :\n{e}"))
+                return
+            new = parse_version(tag)
+            if new and url and new > cur:
+                self.after(0, lambda: self.offer_update(tag, url))
+            elif not silent:
+                self.after(0, lambda: messagebox.showinfo("Mise à jour", f"Vous avez déjà la dernière version (v{VERSION})."))
+        threading.Thread(target=work, daemon=True).start()
+
+    def offer_update(self, tag, url):
+        if not messagebox.askyesno("Mise à jour", f"Nouvelle version {tag} disponible (vous : v{VERSION}).\n\nInstaller maintenant ?"):
+            return
+        import urllib.request
+        exe = sys.executable
+        tmp = exe + ".new"
+        try:
+            self.count.config(text="Téléchargement de la mise à jour…")
+            self.update_idletasks()
+            urllib.request.urlretrieve(url, tmp)
+        except Exception as e:
+            messagebox.showerror("Mise à jour", f"Téléchargement impossible :\n{e}")
+            return
+        # un exe ouvert ne peut pas s'écraser lui-même : petit script qui attend la fermeture
+        bat = os.path.join(tempfile.gettempdir(), "maj_polices.bat")
+        with open(bat, "w", encoding="mbcs") as f:
+            f.write(f'@echo off\r\n:boucle\r\ntimeout /t 1 /nobreak >nul\r\n'
+                    f'move /y "{tmp}" "{exe}" >nul 2>&1 || goto boucle\r\n'
+                    f'start "" "{exe}"\r\ndel "%~f0"\r\n')
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
+        self.save_cfg()
+        self.destroy()
+
     def open_folder(self):
         sel = self.selected()
         target = sel[0].path if sel else USER_FONTS
@@ -568,7 +703,7 @@ class InstallDialog(tk.Toplevel):
         self.imgs = []
         y = 0
         for f, fi in items:
-            cv.create_text(0, y, anchor="nw", text=fi.name, fill="#666", font=("Segoe UI", 9))
+            cv.create_text(0, y, anchor="nw", text=fi.name, fill=MUTED, font=("Segoe UI", 9))
             try:
                 font = ImageFont.truetype(f, 26)
                 im = Image.new("RGB", (560, 40), BG)

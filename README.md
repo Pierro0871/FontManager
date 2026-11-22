@@ -17,3 +17,13 @@ Astuce : glisser des `.zip`/`.ttf` sur `Lancer.bat` les propose directement à l
 - Installer depuis **.ttf .otf .ttc .zip .rar .7z** (archives imbriquées ok), avec aperçu avant
   installation et doublons ignorés. Installation pour l'utilisateur courant, sans droits admin.
 - RAR/7z : utilise 7-Zip s'il est installé (recommandé : https://www.7-zip.org).
+
+## Nouveautés
+- **Mode sombre** : bouton 🌙 / ☀ en haut à droite (mémorisé).
+- **Mise à jour intégrée** (exe) : vérifie GitHub au démarrage + bouton « ⬆ Mise à jour ».
+  Télécharge le nouvel exe, le remplace et relance tout seul.
+- **Filtre Doublons** : polices installées en plusieurs fichiers.
+- **Exporter…** : copie les fichiers des polices sélectionnées (ou affichées) dans un dossier (sauvegarde).
+- **Ctrl+C** : copie le nom des polices sélectionnées.
+
+Télécharger l'exe : https://github.com/Pierro0871/FontManager/releases/latest
