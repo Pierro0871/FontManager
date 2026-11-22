@@ -55,3 +55,8 @@ La liste montre une ligne par famille ; la flèche ▸ (ou la touche →) affich
 Clic droit sur une case de collection : renommer, changer la couleur, exporter en zip, réinstaller depuis la corbeille, tout désinstaller, vider, supprimer.
 
 Le tri rapide marche par famille ; les touches 1 à 9 y rangent aussi la famille affichée.
+
+## Trier (v1.8)
+- **Non rangées** : case sous « Toutes les polices ». Elle montre les familles qui ne sont dans aucune collection. Une police rangée quitte la liste et la suivante est sélectionnée, donc il suffit d'enchaîner les touches 1 à 9.
+- **Glisser** : un aperçu de la police suit la souris, et la case de collection visée s'encadre.
+- **Collections de départ**, créées une seule fois : Titres, Texte courant, Manuscrite, Logo, Fun & déco, Rétro, Pro & sobre, À supprimer. Clic droit sur une case pour la renommer ou la supprimer.

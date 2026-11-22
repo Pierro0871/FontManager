@@ -53,6 +53,10 @@ PROTECTED = ("segoe", "arial", "times new roman", "courier new", "calibri", "cam
              "sitka", "bahnschrift", "ink free", "holomdl2", "sans serif collection")
 STYLES = ["Serif", "Sans", "Script", "Déco", "Mono", "Symbole", "Gras", "Italique"]
 # couleurs proposées pour les collections, dans l'ordre
+# collections créées au premier lancement (une seule fois), avec leur couleur
+DEFAULT_COLS = [("Titres", "#e5484d"), ("Texte courant", "#0090ff"), ("Manuscrite", "#d6409f"),
+                ("Logo", "#f76b15"), ("Fun & déco", "#e2a400"), ("Rétro", "#12a594"),
+                ("Pro & sobre", "#6e56cf"), ("À supprimer", "#7c7c7c")]
 PALETTE = ["#e5484d", "#f76b15", "#e2a400", "#46a758", "#12a594", "#0090ff", "#6e56cf", "#d6409f", "#7c7c7c"]
 REG_PATH = r"Software\Microsoft\Windows NT\CurrentVersion\Fonts"
 ROW_H = 64
@@ -479,6 +483,12 @@ class App(BaseTk):
         c.setdefault("tags", {})
         c.setdefault("collections", {})
         c.setdefault("col_colors", {})
+        if not c.get("defaults_done"):
+            for name, color in DEFAULT_COLS:
+                if name not in c["collections"]:
+                    c["collections"][name] = []
+                    c["col_colors"].setdefault(name, color)
+            c["defaults_done"] = True
         return c
 
     def save_cfg(self):
@@ -499,7 +509,7 @@ class App(BaseTk):
         return self.cfg.get("prev_bg") or BG
 
     def filter_values(self):
-        return (["Toutes", "Favoris", "Installées par moi", "Système", "Doublons"]
+        return (["Toutes", "Non rangées", "Favoris", "Installées par moi", "Système", "Doublons"]
                 + [f"Style : {s}" for s in STYLES]
                 + [f"📁 {c}" for c in self.cfg["collections"]])
 
@@ -638,7 +648,10 @@ class App(BaseTk):
             return (not q or q in x.name.lower() or q in os.path.basename(x.path).lower()
                     or any(q in c.lower() for c in self.colmap.get(x.path, ())))
         v = [x for x in self.fonts if match(x)]
-        if f == "Favoris":
+        if f == "Non rangées":
+            ranged = {fam_key(x) for x in self.fonts if x.path in self.colmap}
+            v = [x for x in v if fam_key(x) not in ranged]
+        elif f == "Favoris":
             v = [x for x in v if self.is_fav(x)]
         elif f == "Installées par moi":
             v = [x for x in v if x.user]
@@ -852,8 +865,60 @@ class App(BaseTk):
         if not d["on"] and abs(e.x - d["x"]) + abs(e.y - d["y"]) > 10:
             d["on"] = True
             self.canvas.config(cursor="hand2")
-            n = len(self.selected())
-            self.count.config(text=f"Lâchez sur une collection pour y ranger {n} police(s)")
+            self.make_ghost()
+        if d["on"]:
+            self.ghost.geometry(f"+{e.x_root + 18}+{e.y_root + 12}")
+            self.hover_col(self.col_under(e.x_root, e.y_root))
+
+    def make_ghost(self):
+        """Étiquette qui suit la souris : aperçu de la police glissée."""
+        rows = [r for r in self.rows if r.key in self.sel]
+        fams = list(dict.fromkeys(fam_key(x) for x in self.selected()))
+        g = self.ghost = tk.Toplevel(self)
+        g.overrideredirect(True)
+        g.attributes("-topmost", True)
+        try:
+            g.attributes("-alpha", 0.92)
+        except tk.TclError:
+            pass
+        box = tk.Frame(g, bg=FIELD, highlightthickness=2, highlightbackground=ACC, padx=10, pady=6)
+        box.pack()
+        im = Image.new("RGBA", (260, 40), FIELD)
+        try:
+            ImageDraw.Draw(im).text((0, 2), rows[0].rep.family, font=ImageFont.truetype(rows[0].rep.path, 26), fill=FG)
+        except Exception:
+            pass
+        g._img = ImageTk.PhotoImage(im)
+        tk.Label(box, image=g._img, bg=FIELD).pack(anchor="w")
+        more = f" et {len(fams) - 1} autre(s) famille(s)" if len(fams) > 1 else ""
+        self.ghost_txt = tk.Label(box, bg=FIELD, fg=MUTED, font=("Segoe UI", 9), anchor="w",
+                                  text=f"{len(self.selected())} fichier(s){more}. Lâchez sur une collection.")
+        self.ghost_txt.pack(anchor="w")
+        self.hovered = None
+
+    def col_under(self, x, y):
+        w = self.winfo_containing(x, y)
+        while w is not None and not hasattr(w, "col_name"):
+            w = w.master
+        return w
+
+    def hover_col(self, w):
+        if w is self.hovered:
+            return
+        if self.hovered is not None and self.hovered.winfo_exists():
+            self.hovered.config(highlightthickness=0, relief="flat")
+        self.hovered = w
+        if w is not None:
+            w.config(highlightthickness=4, highlightbackground=FG, relief="raised")
+            self.ghost_txt.config(text=f"Ranger dans « {w.col_name} »", fg=self.col_color(w.col_name))
+        else:
+            self.ghost_txt.config(text="Lâchez sur une collection.", fg=MUTED)
+
+    def end_ghost(self):
+        if getattr(self, "ghost", None) is not None:
+            self.hover_col(None)
+            self.ghost.destroy()
+            self.ghost = None
 
     def on_release(self, e):
         d, self.drag = self.drag, None
@@ -861,9 +926,8 @@ class App(BaseTk):
         if not d:
             return
         if d["on"]:
-            w = self.winfo_containing(e.x_root, e.y_root)
-            while w is not None and not hasattr(w, "col_name"):
-                w = w.master
+            w = self.col_under(e.x_root, e.y_root)
+            self.end_ghost()
             if w is not None:
                 self.add_to_col(w.col_name, self.selected())
             else:
@@ -1028,6 +1092,10 @@ class App(BaseTk):
 
         big(f"Toutes les polices\n{len({fam_key(x) for x in self.fonts})} familles", FIELD, FG,
             lambda: self.filter.set("Toutes"), active == "Toutes")
+        ranged = {fam_key(x) for x in self.fonts if x.path in self.colmap}
+        loose = len({fam_key(x) for x in self.fonts} - ranged)
+        big(f"Non rangées\n{loose} famille{'s' if loose > 1 else ''} à trier", blend(FIELD, ACC, 0.18), FG,
+            lambda: self.filter.set("Non rangées"), active == "Non rangées")
         for i, (name, paths) in enumerate(cols.items()):
             col = self.col_color(name)
             fams = {fam_key(present[p]) for p in paths if p in present}
@@ -1057,10 +1125,17 @@ class App(BaseTk):
     def add_to_col(self, name, fonts):
         if not fonts:
             return
+        keys = [r.key for r in self.rows]
+        pos = keys.index(self.anchor) if self.anchor in keys else 0
         paths = family_paths(self.fonts, fonts)
         cur = set(self.cfg["collections"].get(name, []))
         self.cfg["collections"][name] = sorted(cur | paths)
         self.cols_changed(f"{len(paths - cur)} fichier(s) ajouté(s) à « {name} »")
+        if self.anchor not in self.rowmap and self.rows:  # la police a quitté la vue : on passe à la suivante
+            nxt = self.rows[min(pos, len(self.rows) - 1)].key
+            self.sel, self.anchor = {nxt}, nxt
+            self.draw()
+            self.show_detail()
 
     def remove_from_col(self, name, fonts):
         paths = family_paths(self.fonts, fonts)
