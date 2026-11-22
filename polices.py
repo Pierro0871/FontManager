@@ -898,7 +898,10 @@ class App(BaseTk):
             f.write(f'@echo off\r\n:boucle\r\ntimeout /t 1 /nobreak >nul\r\n'
                     f'move /y "{tmp}" "{exe}" >nul 2>&1 || goto boucle\r\n'
                     f'start "" "{exe}"\r\ndel "%~f0"\r\n')
-        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
+        # sans ça le nouvel exe réutilise le dossier temporaire (effacé) de l'ancien → "Failed to load Python DLL"
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("_PYI", "_MEI"))}
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000, env=env)
         self.save_cfg()
         self.destroy()
 
