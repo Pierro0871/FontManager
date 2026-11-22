@@ -319,6 +319,16 @@ def uninstall_font(fi):
     move_to_trash(fi)
 
 
+def create_shortcut(exe):
+    q = lambda t: t.replace("'", "''")  # apostrophe dans le chemin (PowerShell)
+    # GetFolderPath gère aussi un bureau déplacé dans OneDrive
+    ps = ("$d=[Environment]::GetFolderPath('Desktop');"
+          "$s=(New-Object -ComObject WScript.Shell).CreateShortcut(\"$d\\Gestionnaire de polices.lnk\");"
+          f"$s.TargetPath='{q(exe)}';$s.WorkingDirectory='{q(os.path.dirname(exe))}';$s.Save()")
+    subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True,
+                   capture_output=True, creationflags=0x08000000)
+
+
 def find_7z():
     for p in (shutil.which("7z"), r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"):
         if p and os.path.exists(p):
@@ -393,6 +403,7 @@ class App(BaseTk):
             v.trace_add("write", lambda *_: self.apply_filter())
         self.reload()
         self.after(2500, lambda: self.check_update(True))
+        self.after(1500, self.offer_shortcut)
 
     # -- config
     def load_cfg(self):
@@ -825,6 +836,18 @@ class App(BaseTk):
 
     def trash_dialog(self):
         TrashDialog(self)
+
+    def offer_shortcut(self):
+        """Une seule fois, dans l'exe : propose une icône sur le bureau."""
+        if not (IS_WIN and getattr(sys, "frozen", False)) or self.cfg.get("shortcut_asked"):
+            return
+        self.cfg["shortcut_asked"] = True
+        self.save_cfg()
+        if messagebox.askyesno("Icône", "Créer une icône sur le bureau ?"):
+            try:
+                create_shortcut(sys.executable)
+            except Exception as e:
+                messagebox.showerror("Icône", f"Impossible de créer l'icône :\n{e}")
 
     def toggle_theme(self):
         self.cfg["theme"] = "clair" if self.cfg.get("theme") == "sombre" else "sombre"
