@@ -7,6 +7,7 @@ Dépendances : pip install pillow rarfile
 """
 import ctypes
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -25,6 +26,9 @@ except Exception:
     BaseTk = tk.Tk
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
+import logging
+
+logging.getLogger("fontTools").setLevel(logging.ERROR)  # avertissements sans importance sur certaines polices
 
 IS_WIN = sys.platform == "win32"
 FONT_EXT = (".ttf", ".otf", ".ttc", ".otc")
@@ -264,6 +268,259 @@ def font_rights(path, user):
     return rights_category(txt, user)
 
 
+# ---------------------------------------------------------------- langues, ressemblance, paires
+LANGS = {
+    "Français": "àâæçéèêëîïôœùûüÿÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ«»€",
+    "Allemand": "äöüßÄÖÜ",
+    "Espagnol": "áéíñóúüÁÉÍÑÓÚ¿¡",
+    "Polonais": "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ",
+    "Turc": "çğışöüÇĞİŞÖÜ",
+    "Cyrillique": "АБВГДЕЖЗабвгдежз",
+    "Grec": "ΑΒΓΔΕΖαβγδεζ",
+    "Vietnamien": "ăâđêôơưĂÂĐÊÔƠƯạảấ",
+}
+DEFAULT_SAMPLES = ["Portez ce vieux whisky au juge blond qui fume", "Sunliner", "Aa Bb Cc 0123456789",
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "Bonjour, c'est l'été !", "Le cœur à l'ouvrage, 12,50 €"]
+
+
+def langs_of(chars):
+    """Langues entièrement couvertes par un jeu de caractères (codes Unicode)."""
+    cs = set(chars)
+    return {name for name, need in LANGS.items() if all(ord(ch) in cs for ch in need)}
+
+
+def font_cmap(path):
+    try:
+        return set(font_tables(path).getBestCmap() or {})
+    except Exception:
+        return set()
+
+
+def broken_reason(path):
+    """Pourquoi un fichier police est abîmé (None s'il est sain).
+    Seule la structure compte : Pillow ne sait pas dessiner certaines polices saines (emoji couleur, bitmap)."""
+    try:
+        if os.path.getsize(path) < 1024:
+            return "fichier vide ou presque"
+        from fontTools.ttLib import TTFont
+        f = TTFont(path, fontNumber=0, lazy=False)
+        cmap = f.getBestCmap() or {}
+        f["head"], f["name"]  # lecture complète des tables essentielles
+    except Exception as e:
+        return f"fichier abîmé ({e.__class__.__name__})"
+    if len(cmap) < 5:
+        return "aucun caractère utilisable"
+    return None
+
+
+def visual_vector(path, word="Hamburgefonstiv"):
+    """Empreinte visuelle : le mot dessiné, réduit à 64x16 niveaux de gris."""
+    f = ImageFont.truetype(path, 48)
+    im = Image.new("L", (900, 90), 0)
+    ImageDraw.Draw(im).text((5, 5), word, font=f, fill=255)
+    box = im.getbbox()
+    if not box:
+        return None
+    v = list(im.crop(box).resize((64, 16)).getdata())
+    n = sum(x * x for x in v) ** 0.5 or 1
+    return [x / n for x in v]
+
+
+def similarity(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def pair_candidates(title, fonts):
+    """Familles qui vont bien avec une police de titre : contraste de style, familles complètes, libres d'abord."""
+    t = title.tags
+    if "Serif" in t:
+        want = {"Sans"}
+    elif "Sans" in t:
+        want = {"Serif"}
+    elif t & {"Script", "Déco"}:
+        want = {"Sans", "Serif"}
+    else:
+        want = {"Sans"}
+    groups = {}
+    for x in fonts:
+        if fam_key(x) != fam_key(title):
+            groups.setdefault(fam_key(x), []).append(x)
+    scored = []
+    for g in groups.values():
+        rep = rep_font(g)
+        if not (rep.tags & want) or rep.tags & {"Script", "Déco", "Symbole", "Mono"}:
+            continue
+        score = min(len(g), 6) * 2 + (3 if rep.rights in ("Libre (OFL, Apache…)", "Domaine public", "100% gratuite") else 0)
+        score += 2 if "Français" in getattr(rep, "langs", set()) else 0
+        scored.append((-score, rep.family.lower(), rep))
+    return [r for _, _, r in sorted(scored)]
+
+
+def fit_font(path, text, max_w, start):
+    """Plus grande taille (<= start) où le texte tient dans max_w pixels."""
+    size = start
+    while size > 8:
+        f = ImageFont.truetype(path, size)
+        if f.getlength(text) <= max_w:
+            return f
+        size = int(size * 0.92)
+    return ImageFont.truetype(path, 8)
+
+
+MOCKUPS = ["Affiche", "Carte de visite", "Post Instagram", "Logo", "T-shirt"]
+
+
+def mockup(kind, title_path, body_path, title, sub, fg, bg):
+    """Maquette dessinée avec Pillow ; renvoie une image RGB."""
+    title, sub = title or "Titre", sub or ""
+    if kind == "Affiche":
+        W, H = 800, 1130
+        im = Image.new("RGB", (W, H), bg)
+        d = ImageDraw.Draw(im)
+        words, lines = title.split(), []
+        for w_ in words:  # une ligne par mot si le titre est long
+            lines.append(w_)
+        f = fit_font(title_path, max(lines, key=len), W - 120, 220)
+        y = 120
+        for ln in lines:
+            d.text((60, y), ln, font=f, fill=fg)
+            y += int(f.size * 1.05)
+        d.line((60, y + 30, W - 60, y + 30), fill=fg, width=4)
+        d.multiline_text((60, y + 60), sub, font=ImageFont.truetype(body_path, 34), fill=fg, spacing=12)
+        d.text((60, H - 90), "Samedi 21 juin  ·  20 h", font=ImageFont.truetype(body_path, 26), fill=fg)
+        return im
+    if kind == "Carte de visite":
+        W, H = 1050, 600
+        im = Image.new("RGB", (W, H), bg)
+        d = ImageDraw.Draw(im)
+        d.text((80, 150), title, font=fit_font(title_path, title, W - 160, 110), fill=fg)
+        fb = ImageFont.truetype(body_path, 34)
+        d.text((80, 300), sub, font=fb, fill=fg)
+        d.text((80, 450), "06 12 34 56 78", font=ImageFont.truetype(body_path, 28), fill=fg)
+        d.text((80, 495), "bonjour@exemple.fr", font=ImageFont.truetype(body_path, 28), fill=fg)
+        return im
+    if kind == "Post Instagram":
+        W = H = 1000
+        im = Image.new("RGB", (W, H), bg)
+        d = ImageDraw.Draw(im)
+        f = fit_font(title_path, title, W - 140, 260)
+        d.text((W / 2, H / 2 - 40), title, font=f, fill=fg, anchor="mm")
+        d.text((W / 2, H / 2 + f.size * 0.6), sub, font=ImageFont.truetype(body_path, 40), fill=fg, anchor="mm")
+        return im
+    if kind == "Logo":
+        W, H = 1000, 560
+        im = Image.new("RGB", (W, H), bg)
+        d = ImageDraw.Draw(im)
+        f = fit_font(title_path, title, W - 200, 200)
+        d.text((W / 2, H / 2 - 30), title, font=f, fill=fg, anchor="mm")
+        spaced = " ".join(sub.upper())  # sous-titre espacé façon signature
+        d.text((W / 2, H / 2 + f.size * 0.55), spaced, font=ImageFont.truetype(body_path, 26), fill=fg, anchor="mm")
+        return im
+    # T-shirt : silhouette dans la couleur de fond, texte sur la poitrine
+    W, H = 900, 1000
+    im = Image.new("RGB", (W, H), "#d9d9d9")
+    d = ImageDraw.Draw(im)
+    d.polygon([(250, 120), (360, 80), (400, 120), (500, 120), (540, 80), (650, 120), (830, 300), (720, 400),
+               (660, 340), (660, 940), (240, 940), (240, 340), (180, 400), (70, 300)], fill=bg)
+    d.ellipse((380, 70, 520, 160), fill="#d9d9d9")
+    f = fit_font(title_path, title, 360, 120)
+    d.text((W / 2, 400), title, font=f, fill=fg, anchor="mm")
+    d.text((W / 2, 400 + f.size * 0.8), sub, font=ImageFont.truetype(body_path, 28), fill=fg, anchor="mm")
+    return im
+
+
+def specimen(fonts, rights, sample):
+    """Planche de présentation d'une famille (PNG)."""
+    rep = rep_font(fonts)
+    W = 1600
+    im = Image.new("RGB", (W, 6000), "#ffffff")
+    d = ImageDraw.Draw(im)
+    ink, grey = "#111111", "#777777"
+    y = 80
+    d.text((80, y), rep.family, font=fit_font(rep.path, rep.family, W - 160, 150), fill=ink)
+    y += 190
+    info = f"{len(fonts)} style(s)   |   Droits : {rights}   |   {', '.join(sorted(rep.tags)) or ''}"
+    d.text((80, y), info, font=ImageFont.truetype(rep.path, 26), fill=grey)
+    y += 80
+    d.line((80, y, W - 80, y), fill=ink, width=3)
+    y += 50
+    for line in ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", "0123456789 àéèçù œ & @ € ?!«»"):
+        d.text((80, y), line, font=fit_font(rep.path, line, W - 160, 72), fill=ink)
+        y += 100
+    y += 30
+    for s_ in (96, 64, 40, 24, 16):
+        d.text((80, y), sample, font=ImageFont.truetype(rep.path, s_), fill=ink)
+        y += int(s_ * 1.5)
+    y += 40
+    d.line((80, y, W - 80, y), fill="#dddddd", width=2)
+    y += 40
+    for x in sorted(fonts, key=lambda x: x.style):
+        d.text((80, y + 8), x.style or "Regular", font=ImageFont.truetype(rep.path, 20), fill=grey)
+        try:
+            d.text((320, y), sample, font=fit_font(x.path, sample, W - 400, 44), fill=ink)
+        except Exception:
+            pass
+        y += 70
+    return im.crop((0, 0, W, y + 80))
+
+
+# ---------------------------------------------------------------- polices d'un document
+DOC_EXT = (".pdf", ".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods", ".idml", ".svg", ".html", ".htm", ".css")
+
+
+def doc_font_names(path):
+    """Noms des polices utilisées dans un document (PDF, Word, PowerPoint, LibreOffice, InDesign IDML, SVG, HTML)."""
+    import re
+    low = path.lower()
+    names = set()
+    if low.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            for page in PdfReader(path).pages:
+                res = page.get("/Resources") or {}
+                fonts = res.get("/Font") or {}
+                for ref in fonts.values():
+                    base = ref.get_object().get("/BaseFont")
+                    if base:
+                        names.add(str(base).lstrip("/"))
+        except Exception:
+            data = open(path, "rb").read()
+            names |= {m.decode("latin-1") for m in re.findall(rb"/BaseFont\s*/([^\s/<>\[\]()]+)", data)}
+    elif low.endswith((".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods", ".idml")):
+        with zipfile.ZipFile(path) as z:
+            for n in z.namelist():
+                if n.endswith(".xml"):
+                    xml = z.read(n).decode("utf-8", "ignore")
+                    for pat in (r'w:name="([^"]+)"', r'w:ascii="([^"]+)"', r'w:hAnsi="([^"]+)"', r'typeface="([^"]+)"',
+                                r'<a:latin typeface="([^"]+)"', r'style:font-name="([^"]+)"', r'svg:font-family="([^"]+)"',
+                                r'FontFamily="([^"]+)"', r'<name val="([^"]+)"'):
+                        names |= set(re.findall(pat, xml))
+    else:
+        txt = open(path, encoding="utf-8", errors="ignore").read()
+        for m in re.findall(r'font-family\s*[:=]\s*["\']?([^;"\'>]+)', txt):
+            names |= {x.strip(" '\"") for x in m.split(",")}
+    clean = set()
+    for n in names:
+        n = n.split("+", 1)[1] if "+" in n[:8] and len(n.split("+", 1)[0]) == 6 else n  # sous-ensemble PDF « ABCDEF+ »
+        n = n.strip()
+        if n and not n.startswith(("+", "@")) and n.lower() not in ("serif", "sans-serif", "monospace", "inherit", "cursive"):
+            clean.add(n)
+    return sorted(clean, key=str.lower)
+
+
+def match_installed(name, fonts):
+    """Police installée qui correspond à un nom trouvé dans un document (ex. « Roboto-BoldItalic »)."""
+    n = norm(name.split("-")[0].split(",")[0])
+    full = norm(name)
+    best = None
+    for x in fonts:
+        f = norm(x.family)
+        if f and (f == full or f == n or (len(f) >= 4 and (full.startswith(f) or n.startswith(f)))):
+            if best is None or len(f) > len(norm(best.family)):
+                best = x
+    return best
+
+
 # ---------------------------------------------------------------- sites de polices
 FONTSOURCE = "https://api.fontsource.org/v1/fonts"
 SQUIRREL = "https://www.fontsquirrel.com/api"
@@ -457,7 +714,7 @@ def empty_trash(keys):
 
 # ---------------------------------------------------------------- polices
 class FontInfo:
-    __slots__ = ("path", "family", "style", "user", "ext", "tags", "rights", "web")
+    __slots__ = ("path", "family", "style", "user", "ext", "tags", "rights", "web", "langs")
 
     def __init__(self, path, family, style, user):
         self.path, self.family, self.style, self.user = path, family, style, user
@@ -465,6 +722,7 @@ class FontInfo:
         self.tags = set()
         self.rights = "Inconnue"
         self.web = ""   # site où les droits ont été vérifiés
+        self.langs = set()
 
     @property
     def name(self):
@@ -478,12 +736,14 @@ def read_font(path, user):
         fi = FontInfo(path, fam or os.path.basename(path), sty or "", user)
         fi.tags = font_style_tags(path, fi.family, fi.style)
         fi.rights = font_rights(path, user)
+        fi.langs = langs_of(font_cmap(path))
         return fi
     except Exception:
         return None
 
 
-def scan_fonts():
+def scan_fonts(broken=None):
+    """Polices lisibles ; les fichiers inutilisables vont dans la liste broken (chemin, utilisateur, raison)."""
     fonts, seen = [], set()
     for folder, user in ((USER_FONTS, True), (SYS_FONTS, False)):
         if not os.path.isdir(folder):
@@ -497,8 +757,12 @@ def scan_fonts():
                         continue
                     seen.add(key)
                     fi = read_font(p, user)
-                    if fi:
+                    reason = broken_reason(p) if broken is not None else None
+                    if reason:
+                        broken.append((p, user, reason))
+                    elif fi:
                         fonts.append(fi)
+                    # sinon : fichier sain que Pillow ne sait pas afficher (emoji couleur…), ignoré
     return fonts
 
 
@@ -627,6 +891,8 @@ class App(BaseTk):
         self.rows, self.rowmap, self.colmap = [], {}, {}
         self.expanded = set()
         self.drag = None
+        self.broken = []
+        self.vectors = {}   # empreintes visuelles (ressemblance), calculées à la demande
 
         self.sample = tk.StringVar(value=self.cfg.get("sample", "Portez ce vieux whisky au juge blond qui fume"))
         self.size = tk.IntVar(value=self.cfg.get("size", 28))
@@ -654,6 +920,8 @@ class App(BaseTk):
         c.setdefault("tags", {})
         c.setdefault("collections", {})
         c.setdefault("col_colors", {})
+        c.setdefault("notes", {})       # famille -> {"stars": 0-5, "text": "..."}
+        c.setdefault("samples", list(DEFAULT_SAMPLES))
         if not c.get("defaults_done"):
             for name, color in DEFAULT_COLS:
                 if name not in c["collections"]:
@@ -689,6 +957,7 @@ class App(BaseTk):
         return (["Toutes", "Non rangées", "Favoris", "Installées par moi", "Système", "Doublons"]
                 + [f"Style : {s}" for s in STYLES]
                 + [f"Droits : {r}" for r, _, _ in RIGHTS]
+                + [f"Langue : {l}" for l in LANGS] + ["Accents français incomplets"]
                 + [f"📁 {c}" for c in self.cfg["collections"]])
 
     # -- construction
@@ -716,6 +985,17 @@ class App(BaseTk):
                          ("🗑 Désinstaller", self.uninstall_sel), ("♻ Corbeille", self.trash_dialog),
                          ("💾 Exporter", self.export_sel), ("📂", self.open_folder), ("⟳", self.reload)):
             ttk.Button(top, text=txt, command=cmd).pack(side="left", padx=(6, 0))
+        tools = ttk.Menubutton(top, text="🧰 Outils")
+        m = tk.Menu(tools, tearoff=0)
+        for label, cmd in (("Paires de polices…", self.pairs), ("Mise en situation…", self.mockups),
+                           ("Polices qui se ressemblent…", self.similar), ("Image de présentation…", self.export_specimen),
+                           (None, None),
+                           ("Polices d'un document (PDF, Word…)…", self.doc_fonts), ("Polices cassées…", self.broken_dialog)):
+            m.add_separator() if label is None else m.add_command(label=label, command=cmd)
+        tools["menu"] = m
+        tools.pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="▦ Grille" if not self.cfg.get("grid") else "☰ Liste", command=self.toggle_grid
+                   ).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="🌙" if self.cfg.get("theme") != "sombre" else "☀", width=3,
                    command=self.toggle_theme).pack(side="right", padx=(8, 0))
         ttk.Button(top, text="⬆ Mise à jour", command=lambda: self.check_update(False)).pack(side="right", padx=(8, 0))
@@ -726,7 +1006,10 @@ class App(BaseTk):
         bar = tk.Frame(self, bg=BAR, padx=10, pady=8)
         bar.pack(fill="x")
         tk.Label(bar, text="Texte :", bg=BAR, fg=FG).pack(side="left")
-        ttk.Entry(bar, textvariable=self.sample, width=40).pack(side="left", padx=(4, 12))
+        self.sample_box = ttk.Combobox(bar, textvariable=self.sample, width=38, values=self.cfg["samples"])
+        self.sample_box.pack(side="left", padx=(4, 2))
+        ttk.Button(bar, text="+", width=2, command=self.save_sample).pack(side="left")
+        ttk.Button(bar, text="−", width=2, command=self.drop_sample).pack(side="left", padx=(2, 12))
         tk.Label(bar, text="Taille :", bg=BAR, fg=FG).pack(side="left")
         ttk.Scale(bar, from_=10, to=72, variable=self.size, length=120,
                   command=lambda v: self.size.set(int(float(v)))).pack(side="left", padx=4)
@@ -738,7 +1021,7 @@ class App(BaseTk):
         self.filter_box.pack(side="left")
         tk.Label(bar, text=" Tri :", bg=BAR, fg=FG).pack(side="left")
         ttk.Combobox(bar, textvariable=self.sort, state="readonly", width=10,
-                     values=["Nom", "Droits", "Type", "Fichier", "Taille"]).pack(side="left", padx=4)
+                     values=["Nom", "Droits", "Note", "Ajout récent", "Type", "Fichier", "Taille"]).pack(side="left", padx=4)
         self.show_sys = tk.BooleanVar(value=not self.cfg.get("hide_system", True))
         tk.Checkbutton(bar, text="Polices Windows", variable=self.show_sys, bg=BAR, fg=FG, selectcolor=FIELD,
                        activebackground=BAR, activeforeground=FG, command=self.toggle_system).pack(side="left", padx=(10, 0))
@@ -767,6 +1050,13 @@ class App(BaseTk):
         self.d_info.pack(fill="x", pady=(2, 4))
         self.d_lic = tk.Label(right, bg=BG, fg=FG, anchor="w", justify="left", wraplength=330)
         self.d_lic.pack(fill="x", pady=(0, 4))
+        self.d_stars = tk.Frame(right, bg=BG)
+        self.d_stars.pack(fill="x", pady=(2, 2))
+        self.d_note = tk.StringVar()
+        ne = ttk.Entry(right, textvariable=self.d_note)
+        ne.pack(fill="x", pady=(0, 6))
+        ne.bind("<Return>", lambda e: (self.save_note(), self.canvas.focus_set()))
+        ne.bind("<FocusOut>", lambda e: self.save_note())
         ttk.Button(right, text="🔤 Tous les caractères", command=self.charmap).pack(anchor="w", pady=(0, 8))
         self.d_img = tk.Label(right, bg=BG, anchor="nw")
         self.d_img.pack(fill="both", expand=True)
@@ -783,18 +1073,18 @@ class App(BaseTk):
         self.canvas.bind("<Button-3>", self.row_menu)
         for n in range(1, 10):
             self.bind(f"<Key-{n}>", lambda e, n=n: None if self.typing() else self.toggle_in_col_n(n))
-        self.bind("<Right>", lambda e: None if self.typing() else self.expand(True))
-        self.bind("<Left>", lambda e: None if self.typing() else self.expand(False))
-        self.bind("<Up>", lambda e: self.move(-1))
-        self.bind("<Down>", lambda e: self.move(1))
-        self.bind("<Prior>", lambda e: self.move(-8))
-        self.bind("<Next>", lambda e: self.move(8))
+        self.bind("<Right>", lambda e: None if self.typing() else (self.move(1) if self.grid_on() else self.expand(True)))
+        self.bind("<Left>", lambda e: None if self.typing() else (self.move(-1) if self.grid_on() else self.expand(False)))
+        self.bind("<Up>", lambda e: self.move(-self.ncols()))
+        self.bind("<Down>", lambda e: self.move(self.ncols()))
+        self.bind("<Prior>", lambda e: self.move(-8 * self.ncols()))
+        self.bind("<Next>", lambda e: self.move(8 * self.ncols()))
         self.bind("<Delete>", lambda e: self.uninstall_sel() if self.focus_get() == self.canvas or not isinstance(self.focus_get(), ttk.Entry) else None)
         self.bind("<f>", lambda e: None if isinstance(self.focus_get(), ttk.Entry) else self.toggle_fav())
         self.bind("<Control-c>", lambda e: None if isinstance(self.focus_get(), ttk.Entry) else self.copy_names())
         if TkinterDnD:
             self.drop_target_register(DND_FILES)
-            self.dnd_bind("<<Drop>>", lambda e: self.after(10, self.install_paths, list(self.tk.splitlist(e.data))))
+            self.dnd_bind("<<Drop>>", lambda e: self.after(10, self.dropped, list(self.tk.splitlist(e.data))))
         self.protocol("WM_DELETE_WINDOW", lambda: (self.save_cfg(), self.destroy()))
         self.build_side()
 
@@ -803,7 +1093,9 @@ class App(BaseTk):
         self.count.config(text="Chargement des polices…")
         box = []
         # Tk n'aime pas être appelé depuis un autre thread : on vérifie le résultat depuis la boucle principale
-        threading.Thread(target=lambda: box.append(scan_fonts()), daemon=True).start()
+        broken = []
+        threading.Thread(target=lambda: box.append(scan_fonts(broken)), daemon=True).start()
+        self.broken = broken
         def poll():
             if box:
                 self.loaded(box[0])
@@ -892,6 +1184,10 @@ class App(BaseTk):
         elif f == "Doublons":
             dups = find_duplicates(self.fonts)
             v = [x for x in v if x.path in dups]
+        elif f.startswith("Langue : "):
+            v = [x for x in v if f[9:] in x.langs]
+        elif f == "Accents français incomplets":
+            v = [x for x in v if "Français" not in x.langs and "Symbole" not in x.tags]
         elif f.startswith("Droits : "):
             v = [x for x in v if x.rights == f[9:]]
         elif f.startswith("Style : "):
@@ -902,6 +1198,8 @@ class App(BaseTk):
         key = {"Nom": lambda x: (x.family.lower(), x.style.lower()),
                "Type": lambda x: (x.ext, x.family.lower()),
                "Fichier": lambda x: os.path.basename(x.path).lower(),
+               "Note": lambda x: (-self.note(x)["stars"], x.family.lower(), x.style.lower()),
+               "Ajout récent": lambda x: -os.path.getctime(x.path) if os.path.exists(x.path) else 0,
                "Droits": lambda x: (RIGHTS_ORDER.get(x.rights, 99), x.family.lower(), x.style.lower()),
                "Taille": lambda x: -os.path.getsize(x.path) if os.path.exists(x.path) else 0}[self.sort.get()]
         v.sort(key=key)
@@ -943,6 +1241,34 @@ class App(BaseTk):
     def row_h(self):
         return max(ROW_H, int(self.size.get() * 1.5) + 26)
 
+    TILE_W, TILE_H = 210, 180
+
+    def grid_on(self):
+        return bool(self.cfg.get("grid"))
+
+    def ncols(self):
+        return max(1, self.canvas.winfo_width() // self.TILE_W) if self.grid_on() else 1
+
+    def cell(self, i):
+        """Position (x, y, largeur, hauteur) de la ligne/tuile i."""
+        if self.grid_on():
+            n = self.ncols()
+            return (i % n) * self.TILE_W, (i // n) * self.TILE_H, self.TILE_W, self.TILE_H
+        return 0, i * self.row_h(), max(self.canvas.winfo_width(), 300), self.row_h()
+
+    def content_h(self):
+        if self.grid_on():
+            return (len(self.rows) + self.ncols() - 1) // self.ncols() * self.TILE_H
+        return len(self.rows) * self.row_h()
+
+    def toggle_grid(self):
+        self.cfg["grid"] = not self.grid_on()
+        self.save_cfg()
+        for w in self.winfo_children():
+            w.destroy()
+        self.build_ui()
+        self.apply_filter()
+
     def yview(self, *args):
         self.canvas.yview(*args)
         self.draw()
@@ -964,7 +1290,50 @@ class App(BaseTk):
                     seen.append(c)
         return [c for c in self.cfg["collections"] if c in seen]
 
+    def note(self, fi):
+        return self.cfg["notes"].get(fam_key(fi), {"stars": 0, "text": ""})
+
+    def draw_grid(self):
+        c = self.canvas
+        c.delete("all")
+        w, h = max(c.winfo_width(), 300), c.winfo_height()
+        TW, TH = self.TILE_W, self.TILE_H
+        c.configure(scrollregion=(0, 0, w, max(self.content_h(), h)), yscrollincrement=TH // 3)
+        top, n = c.canvasy(0), self.ncols()
+        first, last = int(top // TH) * n, (int((top + h) // TH) + 1) * n
+        for i in range(max(0, first), min(len(self.rows), last + n)):
+            row = self.rows[i]
+            x, y, _, _ = self.cell(i)
+            cols = self.row_cols(row)
+            fill = SEL if row.key in self.sel else (blend(BG, self.col_color(cols[0]), 0.12) if cols else BG)
+            c.create_rectangle(x + 4, y + 4, x + TW - 4, y + TH - 4, fill=fill, outline=LINE)
+            for k, cn in enumerate(cols):
+                c.create_rectangle(x + 4 + k * 14, y + 4, x + 16 + k * 14, y + 10, fill=self.col_color(cn), width=0)
+            key = (row.rep.path, "Aa", 84, TW - 20, "grid")
+            img = self.cache.get(key)
+            if img is None:
+                try:
+                    bg = self.cfg.get("prev_bg")
+                    im = Image.new("RGBA", (TW - 20, 110), bg if bg else (0, 0, 0, 0))
+                    ImageDraw.Draw(im).text(((TW - 20) / 2, 55), "Aa", font=ImageFont.truetype(row.rep.path, 84),
+                                            fill=self.pfg(), anchor="mm")
+                except Exception:
+                    im = Image.new("RGBA", (TW - 20, 110), (0, 0, 0, 0))
+                img = self.cache[key] = ImageTk.PhotoImage(im)
+            c.create_image(x + 10, y + 12, anchor="nw", image=img)
+            stars = "★" * self.note(row.rep)["stars"]
+            name = row.rep.family if row.fam else row.fonts[0].name
+            c.create_text(x + TW / 2, y + 132, text=(("⭐ " if any(self.is_fav(f) for f in row.fonts) else "") + name)[:26],
+                          fill=FG, font=("Segoe UI", 9, "bold"))
+            c.create_text(x + TW / 2, y + 152, fill=RIGHTS_COLOR.get(row.rep.rights, MUTED), font=("Segoe UI", 8),
+                          text=f"{row.rep.rights}{'  ' + stars if stars else ''}")
+        if not self.rows:
+            c.create_text(w // 2, 60, text="Aucune police ne correspond. Videz la recherche ou changez de filtre.",
+                          fill=MUTED, font=("Segoe UI", 11))
+
     def draw(self):
+        if self.grid_on():
+            return self.draw_grid()
         c = self.canvas
         c.delete("all")
         w, h, rh = max(c.winfo_width(), 300), c.winfo_height(), self.row_h()
@@ -993,6 +1362,11 @@ class App(BaseTk):
                 x0 += 18
             if any(self.is_fav(x) for x in row.fonts):
                 label = "⭐ " + label
+            st_ = self.note(row.rep)["stars"]
+            if st_:
+                label += "   " + "★" * st_
+            if "Français" not in row.rep.langs and "Symbole" not in row.rep.tags:
+                label += "   ⚠ accents incomplets"
             if not row.rep.user:
                 label += "   système"
             t = c.create_text(x0, y + 6, anchor="nw", text=label, fill=MUTED, font=("Segoe UI", 9))
@@ -1027,6 +1401,7 @@ class App(BaseTk):
                                     "F ou double-clic : favori. Suppr : désinstaller. Ctrl+C : copier le nom.")
             self.d_img.config(image="")
             self.d_lic.config(text="")
+            self.show_stars(None)
             return
         try:
             kb = os.path.getsize(fi.path) // 1024
@@ -1036,7 +1411,10 @@ class App(BaseTk):
         self.d_info.config(text=f"{os.path.basename(fi.path)} · {kb} Ko · {fi.ext[1:].upper()}\n"
                                 f"{'Installée pour vous' if fi.user else 'Police système'}"
                                 f"{' · 🔒 protégée' if is_protected(fi.family, fi.user) else ''}\n"
-                                f"Style : {', '.join(sorted(fi.tags)) or '?'}\n{fi.path}")
+                                f"Style : {', '.join(sorted(fi.tags)) or '?'}\n"
+                                f"Langues : {', '.join(sorted(fi.langs)) or 'aucune complète'}\n"
+                                f"Installée le {self.install_date(fi)}\n{fi.path}")
+        self.show_stars(fi)
         lic = font_license(fi.path)
         self.d_lic.config(text=f"Droits : {fi.rights}. {RIGHTS_HELP.get(fi.rights, '')}\n"
                                + (f"Vérifié en ligne sur {fi.web}.\n" if fi.web else "")
@@ -1068,12 +1446,19 @@ class App(BaseTk):
         return isinstance(self.focus_get(), (ttk.Entry, tk.Entry))
 
     def row_at(self, e):
-        i = int(self.canvas.canvasy(e.y) // self.row_h())
+        y = self.canvas.canvasy(e.y)
+        if self.grid_on():
+            col = int(e.x // self.TILE_W)
+            if col >= self.ncols():
+                return None
+            i = int(y // self.TILE_H) * self.ncols() + col
+        else:
+            i = int(y // self.row_h())
         return self.rows[i] if 0 <= i < len(self.rows) else None
 
     def hit_arrow(self, e):
         row = self.row_at(e)
-        return bool(row and row.fam and e.x < 34)
+        return bool(row and row.fam and e.x < 34 and not self.grid_on())
 
     def on_press(self, e):
         self.canvas.focus_set()
@@ -1187,8 +1572,7 @@ class App(BaseTk):
         """Recalcule la liste sans perdre la position de défilement."""
         top = self.canvas.canvasy(0)  # en pixels : la liste peut avoir raccourci
         self.apply_filter()
-        total = max(1, len(self.rows) * self.row_h())
-        self.canvas.yview_moveto(top / total)
+        self.canvas.yview_moveto(top / max(1, self.content_h()))
         self.draw()
 
     def expand(self, open_):
@@ -1204,10 +1588,10 @@ class App(BaseTk):
         i = keys.index(self.anchor) + d if self.anchor in keys else 0
         i = max(0, min(len(keys) - 1, i))
         self.anchor, self.sel = keys[i], {keys[i]}
-        rh, h = self.row_h(), self.canvas.winfo_height()
-        top = self.canvas.canvasy(0)
-        if i * rh < top or (i + 1) * rh > top + h:
-            self.canvas.yview_moveto(max(0, i * rh - h / 3) / max(1, len(keys) * rh))
+        _, y, _, rh = self.cell(i)
+        h, top = self.canvas.winfo_height(), self.canvas.canvasy(0)
+        if y < top or y + rh > top + h:
+            self.canvas.yview_moveto(max(0, y - h / 3) / max(1, self.content_h()))
         self.draw()
         self.show_detail()
 
@@ -1458,6 +1842,15 @@ class App(BaseTk):
         m.add_command(label="Comparer", command=self.compare)
         m.add_command(label="Tous les caractères", command=self.charmap)
         m.add_command(label="Copier le nom", command=self.copy_names)
+        notes = tk.Menu(m, tearoff=0)
+        for n in range(6):
+            notes.add_command(label="★" * n + "☆" * (5 - n) if n else "Pas de note", command=lambda n=n: self.set_stars(n))
+        m.add_cascade(label="Note", menu=notes)
+        m.add_separator()
+        m.add_command(label="Paires de polices", command=self.pairs)
+        m.add_command(label="Polices qui se ressemblent", command=self.similar)
+        m.add_command(label="Mise en situation", command=self.mockups)
+        m.add_command(label="Image de présentation…", command=self.export_specimen)
         m.add_separator()
         m.add_command(label="Désinstaller…", command=self.uninstall_sel)
         m.tk_popup(e.x_root, e.y_root)
@@ -1588,6 +1981,111 @@ class App(BaseTk):
                 create_shortcut(sys.executable)
             except Exception as e:
                 messagebox.showerror("Icône", f"Impossible de créer l'icône :\n{e}")
+
+    # -- notes, textes d'aperçu, dates
+    def show_stars(self, fi):
+        for w in self.d_stars.winfo_children():
+            w.destroy()
+        if fi is None:
+            self.d_note.set("")
+            return
+        n = self.note(fi)
+        for k in range(1, 6):
+            lb = tk.Label(self.d_stars, text="★" if k <= n["stars"] else "☆", bg=BG, cursor="hand2",
+                          fg="#e2a400" if k <= n["stars"] else MUTED, font=("Segoe UI", 16))
+            lb.pack(side="left")
+            lb.bind("<Button-1>", lambda e, k=k: self.set_stars(0 if self.note(fi)["stars"] == k else k))
+        tk.Label(self.d_stars, text="  note perso :", bg=BG, fg=MUTED).pack(side="left")
+        self.d_note.set(n["text"])
+        self._note_fam = fam_key(fi)
+
+    def set_stars(self, k):
+        for fam in {fam_key(x) for x in self.selected()}:
+            n = self.cfg["notes"].setdefault(fam, {"stars": 0, "text": ""})
+            n["stars"] = k
+        self.save_cfg()
+        self.draw()
+        self.show_detail()
+
+    def save_note(self):
+        fam = getattr(self, "_note_fam", None)
+        if fam is None:
+            return
+        n = self.cfg["notes"].setdefault(fam, {"stars": 0, "text": ""})
+        if n["text"] != self.d_note.get():
+            n["text"] = self.d_note.get()
+            self.save_cfg()
+
+    def save_sample(self):
+        t = self.sample.get().strip()
+        if t and t not in self.cfg["samples"]:
+            self.cfg["samples"].append(t)
+            self.sample_box.config(values=self.cfg["samples"])
+            self.save_cfg()
+
+    def drop_sample(self):
+        t = self.sample.get()
+        if t in self.cfg["samples"]:
+            self.cfg["samples"].remove(t)
+            self.sample_box.config(values=self.cfg["samples"])
+            self.save_cfg()
+
+    @staticmethod
+    def install_date(fi):
+        import time
+        try:
+            return time.strftime("%d/%m/%Y", time.localtime(os.path.getctime(fi.path)))
+        except OSError:
+            return "?"
+
+    # -- outils
+    def cur_row(self):
+        row = self.rowmap.get(self.anchor)
+        if not row:
+            messagebox.showinfo("Outils", "Sélectionnez d'abord une police.")
+        return row
+
+    def pairs(self):
+        row = self.cur_row()
+        if row:
+            PairWindow(self, row.rep)
+
+    def mockups(self):
+        reps = [r.rep for r in self.rows if r.key in self.sel]
+        if reps or self.cur_row():
+            MockupWindow(self, reps or [self.cur_row().rep])
+
+    def similar(self):
+        row = self.cur_row()
+        if row:
+            SimilarWindow(self, row.rep)
+
+    def export_specimen(self):
+        row = self.cur_row()
+        if not row:
+            return
+        dest = filedialog.asksaveasfilename(title="Image de présentation", defaultextension=".png",
+                                            initialfile=f"{row.rep.family}.png", filetypes=[("Image PNG", "*.png")])
+        if dest:
+            specimen(row.fonts, row.rep.rights, self.sample.get() or row.rep.family).save(dest)
+            self.count.config(text=f"Image enregistrée : {os.path.basename(dest)}")
+
+    def dropped(self, paths):
+        docs = [p for p in paths if p.lower().endswith(DOC_EXT)]
+        rest = [p for p in paths if p not in docs]
+        if rest:
+            self.install_paths(rest)
+        for p in docs:
+            DocFontsWindow(self, p)
+
+    def doc_fonts(self):
+        p = filedialog.askopenfilename(title="Document à analyser",
+                                       filetypes=[("Documents", " ".join("*" + e for e in DOC_EXT)), ("Tous", "*.*")])
+        if p:
+            DocFontsWindow(self, p)
+
+    def broken_dialog(self):
+        BrokenWindow(self)
 
     def toggle_theme(self):
         self.cfg["theme"] = "clair" if self.cfg.get("theme") == "sombre" else "sombre"
@@ -2072,6 +2570,247 @@ class FontSearch(Win):
         import urllib.parse
         import webbrowser
         webbrowser.open("https://www.dafont.com/search.php?q=" + urllib.parse.quote(self.q.get().strip()))
+
+
+class ScrollImage(tk.Frame):
+    """Image verticale qui défile (pour les listes d'aperçus)."""
+
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+        self.cv = tk.Canvas(self, bg=BG, highlightthickness=0)
+        sb = ttk.Scrollbar(self, command=self.cv.yview)
+        self.cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<MouseWheel>", lambda e: self.cv.yview_scroll(-e.delta // 120, "units"))
+        self.cv.bind("<Button-4>", lambda e: self.cv.yview_scroll(-3, "units"))
+        self.cv.bind("<Button-5>", lambda e: self.cv.yview_scroll(3, "units"))
+
+    def show(self, im):
+        self._img = ImageTk.PhotoImage(im)
+        self.cv.delete("all")
+        self.cv.create_image(0, 0, anchor="nw", image=self._img)
+        self.cv.configure(scrollregion=(0, 0, im.width, im.height))
+
+
+class PairWindow(Win):
+    def __init__(self, app, title_font):
+        super().__init__(app, f"Paires pour {title_font.family}", "980x700")
+        self.t = title_font
+        self.cands = pair_candidates(title_font, app.pool())[:8]
+        tk.Label(self, bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=900,
+                 text=f"Titre en {title_font.family}, texte dans une famille de style opposé, choisie parmi vos polices "
+                      "(familles complètes et libres en premier).").pack(fill="x", padx=12, pady=(10, 4))
+        self.view = ScrollImage(self)
+        self.view.pack(fill="both", expand=True, padx=12, pady=8)
+        self.draw()
+
+    def draw(self):
+        W, blocks = 920, []
+        para = ("Une police de titre attire l'œil, une police de texte se fait oublier. "
+                "Ensemble, elles donnent le ton : 12 août, 19 h, entrée libre à 9,50 €.")
+        for c in self.cands or [None]:
+            im = Image.new("RGB", (W, 250), self.app.pbg())
+            d = ImageDraw.Draw(im)
+            if c is None:
+                d.text((20, 20), "Aucune police de texte adaptée dans votre liste.", fill=MUTED)
+                blocks.append(im)
+                break
+            d.text((20, 10), f"{self.t.family}  +  {c.family}   ({c.rights})", fill=MUTED)
+            d.text((20, 34), self.app.sample.get() or self.t.family,
+                   font=fit_font(self.t.path, self.app.sample.get() or self.t.family, W - 40, 56), fill=self.app.pfg())
+            fb, y, line = ImageFont.truetype(c.path, 19), 120, ""
+            for word in para.split():
+                if fb.getlength(line + " " + word) > W - 40:
+                    d.text((20, y), line, font=fb, fill=self.app.pfg())
+                    y, line = y + 28, word
+                else:
+                    line = (line + " " + word).strip()
+            d.text((20, y), line, font=fb, fill=self.app.pfg())
+            d.line((0, 248, W, 248), fill=LINE)
+            blocks.append(im)
+        full = Image.new("RGB", (W, sum(b.height for b in blocks)), BG)
+        y = 0
+        for b in blocks:
+            full.paste(b, (0, y))
+            y += b.height
+        self.view.show(full)
+
+
+class MockupWindow(Win):
+    def __init__(self, app, fonts):
+        super().__init__(app, "Mise en situation", "1000x760")
+        self.fonts = fonts
+        bar = tk.Frame(self, bg=BAR, padx=10, pady=6)
+        bar.pack(fill="x")
+        self.kind = tk.StringVar(value=MOCKUPS[0])
+        ttk.Combobox(bar, textvariable=self.kind, values=MOCKUPS, state="readonly", width=16).pack(side="left")
+        self.title_v = tk.StringVar(value=app.sample.get() if len(app.sample.get()) < 24 else "Sunliner")
+        self.sub_v = tk.StringVar(value="Direction artistique")
+        for lbl, var, w in (("Titre", self.title_v, 22), ("Sous-titre", self.sub_v, 24)):
+            tk.Label(bar, text=f"  {lbl} :", bg=BAR, fg=FG).pack(side="left")
+            ttk.Entry(bar, textvariable=var, width=w).pack(side="left")
+        ttk.Button(bar, text="Enregistrer en PNG…", command=self.save).pack(side="right")
+        tk.Label(self, bg=BG, fg=MUTED, anchor="w",
+                 text=f"Titre : {fonts[0].family}.  Texte : {fonts[min(1, len(fonts) - 1)].family}.  "
+                      "Sélectionnez 2 polices (Ctrl+clic) pour changer la police du texte. "
+                      "Couleurs : boutons A et ▇ de la fenêtre principale.").pack(fill="x", padx=12, pady=4)
+        self.lbl = tk.Label(self, bg=BG)
+        self.lbl.pack(fill="both", expand=True, padx=10, pady=10)
+        for v in (self.kind, self.title_v, self.sub_v):
+            v.trace_add("write", lambda *_: self.after_idle(self.draw))
+        self.draw()
+
+    def render(self):
+        f = self.fonts
+        return mockup(self.kind.get(), f[0].path, f[min(1, len(f) - 1)].path, self.title_v.get(), self.sub_v.get(),
+                      self.app.pfg(), self.app.pbg())
+
+    def draw(self):
+        try:
+            im = self.render()
+        except Exception as e:
+            self.lbl.config(text=f"Impossible de dessiner : {e}", image="", fg=FG)
+            return
+        im.thumbnail((900, 600))
+        self._img = ImageTk.PhotoImage(im)
+        self.lbl.config(image=self._img, text="")
+
+    def save(self):
+        dest = filedialog.asksaveasfilename(parent=self, defaultextension=".png", filetypes=[("Image PNG", "*.png")],
+                                            initialfile=f"{self.kind.get()} - {self.fonts[0].family}.png")
+        if dest:
+            self.render().save(dest)
+
+
+class SimilarWindow(Win):
+    def __init__(self, app, ref):
+        super().__init__(app, f"Ressemble à {ref.family}", "980x700")
+        self.ref = ref
+        self.msg = tk.Label(self, bg=BG, fg=MUTED, anchor="w", text="Comparaison des formes en cours…")
+        self.msg.pack(fill="x", padx=12, pady=(10, 4))
+        self.view = ScrollImage(self)
+        self.view.pack(fill="both", expand=True, padx=12, pady=8)
+        reps = {}
+        for x in app.pool():
+            reps.setdefault(fam_key(x), []).append(x)
+        self.reps = [rep_font(g) for g in reps.values()]
+        cache = app.vectors
+        def work():
+            for x in self.reps + [ref]:
+                if x.path not in cache:
+                    try:
+                        cache[x.path] = visual_vector(x.path)
+                    except Exception:
+                        cache[x.path] = None
+            v0 = cache.get(ref.path)
+            scored = [(similarity(v0, cache[x.path]), x) for x in self.reps
+                      if v0 and cache.get(x.path) and fam_key(x) != fam_key(ref)]
+            return sorted(scored, key=lambda t: -t[0])[:12]
+        app.run_bg(work, self.show)
+
+    def show(self, scored):
+        if not self.winfo_exists():
+            return
+        self.msg.config(text=f"Les {len(scored)} familles de votre liste dont les lettres ressemblent le plus à {self.ref.family}.")
+        W, blocks = 920, []
+        for score, x in [(1.0, self.ref)] + scored:
+            im = Image.new("RGB", (W, 92), self.app.pbg())
+            d = ImageDraw.Draw(im)
+            d.text((14, 6), f"{x.family}   {round(score * 100)} % de ressemblance" if x is not self.ref
+                   else f"{x.family}   (référence)", fill=MUTED)
+            try:
+                d.text((14, 26), self.app.sample.get() or "Hamburgefonstiv",
+                       font=fit_font(x.path, self.app.sample.get() or "Hamburgefonstiv", W - 28, 44), fill=self.app.pfg())
+            except Exception:
+                pass
+            d.line((0, 91, W, 91), fill=LINE)
+            blocks.append(im)
+        full = Image.new("RGB", (W, len(blocks) * 92), BG)
+        for k, b in enumerate(blocks):
+            full.paste(b, (0, k * 92))
+        self.view.show(full)
+
+
+class DocFontsWindow(Win):
+    def __init__(self, app, path):
+        super().__init__(app, f"Polices de {os.path.basename(path)}", "640x520")
+        try:
+            names = doc_font_names(path)
+        except Exception as e:
+            names, err = [], str(e)
+        else:
+            err = ""
+        rows = [(n, match_installed(n, app.fonts)) for n in names]
+        missing = [n for n, m in rows if m is None]
+        head = (f"{len(names)} police(s) utilisée(s), {len(missing)} manquante(s)." if names else
+                f"Aucune police trouvée dans ce document. {err}")
+        tk.Label(self, text=head, bg=BG, fg=FG, font=("Segoe UI", 11, "bold"), anchor="w").pack(fill="x", padx=12, pady=10)
+        self.tree = ttk.Treeview(self, columns=("etat",), show="tree headings", height=14)
+        self.tree.heading("#0", text="Nom dans le document")
+        self.tree.heading("etat", text="Sur ce PC")
+        self.tree.column("etat", width=230)
+        for i, (n, m) in enumerate(rows):
+            self.tree.insert("", "end", iid=str(i), text=n, values=(f"✓ {m.family}" if m else "✗ manquante",))
+        self.tree.pack(fill="both", expand=True, padx=12)
+        b = tk.Frame(self, bg=BG)
+        b.pack(fill="x", padx=12, pady=10)
+        self.rows = rows
+        ttk.Button(b, text="Chercher la police sélectionnée en ligne", style="Accent.TButton",
+                   command=self.search).pack(side="left")
+        ttk.Button(b, text="Copier la liste des manquantes",
+                   command=lambda: (self.clipboard_clear(), self.clipboard_append("\n".join(missing)))).pack(side="left", padx=6)
+
+    def search(self):
+        sel = self.tree.selection()
+        if sel:
+            name = self.rows[int(sel[0])][0]
+            w = FontSearch(self.app)
+            w.q.set(re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name.split("-")[0]))
+
+
+class BrokenWindow(Win):
+    def __init__(self, app):
+        super().__init__(app, "Polices cassées", "720x460")
+        self.items = [b for b in app.broken if not is_protected(os.path.basename(b[0]), b[1])]
+        tk.Label(self, bg=BG, fg=FG, anchor="w", font=("Segoe UI", 11, "bold"),
+                 text=f"{len(self.items)} fichier(s) police inutilisable(s)." if self.items
+                 else "Aucune police cassée trouvée.").pack(fill="x", padx=12, pady=10)
+        self.lb = tk.Listbox(self, selectmode="extended", bg=FIELD, fg=FG, selectbackground=ACC,
+                             highlightthickness=0, borderwidth=0, font=("Segoe UI", 10))
+        for p, user, reason in self.items:
+            self.lb.insert("end", f"{os.path.basename(p)}  —  {reason}{'' if user else '  (système)'}")
+        self.lb.pack(fill="both", expand=True, padx=12)
+        b = tk.Frame(self, bg=BG)
+        b.pack(fill="x", padx=12, pady=10)
+        ttk.Button(b, text="Mettre la sélection à la corbeille", style="Accent.TButton", command=self.trash).pack(side="left")
+        ttk.Button(b, text="Tout sélectionner", command=lambda: self.lb.select_set(0, "end")).pack(side="left", padx=6)
+
+    def trash(self):
+        idx = list(self.lb.curselection())
+        if not idx:
+            return
+        nsys = sum(not self.items[i][1] for i in idx)
+        warn = f"\n\n{nsys} fichier(s) système : droits administrateur nécessaires." if nsys else ""
+        if not messagebox.askyesno("Corbeille", f"Mettre {len(idx)} fichier(s) à la corbeille ?\n"
+                                   f"Vous pourrez les restaurer.{warn}", parent=self):
+            return
+        done, errs = [], []
+        for i in idx:
+            p, user, reason = self.items[i]
+            fi = FontInfo(p, os.path.splitext(os.path.basename(p))[0], "", user)
+            try:
+                uninstall_font(fi)
+                done.append(i)
+            except Exception as e:
+                errs.append(f"{os.path.basename(p)} : {e}")
+        for i in sorted(done, reverse=True):
+            self.lb.delete(i)
+            self.items.pop(i)
+            self.app.broken.pop(i)
+        notify_font_change()
+        if errs:
+            messagebox.showwarning("Corbeille", "\n".join(errs[:10]), parent=self)
 
 
 class InstallDialog(tk.Toplevel):

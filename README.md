@@ -83,3 +83,19 @@ Le classement est deviné à partir du texte de licence rangé dans le fichier. 
 **Droits vérifiés en ligne** : au démarrage, l'appli compare vos polices au catalogue de Google Fonts et de Font Squirrel, en arrière-plan. Quand une police y figure, sa licence officielle remplace celle devinée depuis le fichier, et son badge affiche « ✓ en ligne ». Le catalogue est gardé une semaine sur le disque.
 
 Font Squirrel refuse parfois les logiciels (réponse vide). Dans ce cas, Google Fonts marche seul et la fenêtre le signale.
+
+## v1.12
+Menu **🧰 Outils** (aussi au clic droit sur une police) :
+- **Paires de polices** : pour la police de titre sélectionnée, propose des familles de texte de style opposé (serif contre sans) prises dans vos polices. Les familles complètes et libres passent en premier.
+- **Mise en situation** : affiche, carte de visite, post Instagram, logo, t-shirt, avec votre titre, sous-titre et couleurs. Enregistrement en PNG.
+- **Polices qui se ressemblent** : compare la forme des lettres et classe vos familles les plus proches.
+- **Image de présentation** : planche PNG d'une famille (alphabet, tailles, tous les styles, droits).
+- **Polices d'un document** : PDF, Word, PowerPoint, Excel, LibreOffice, InDesign (IDML), SVG, HTML, CSS. Liste les polices utilisées et dit lesquelles manquent. Vous pouvez aussi glisser le document dans la fenêtre.
+- **Polices cassées** : fichiers abîmés ou vides, à mettre à la corbeille après confirmation.
+
+Autres ajouts :
+- **Langues** : filtres « Langue : … » et « Accents français incomplets » ; la mention « ⚠ accents incomplets » apparaît dans la liste.
+- **Notes** : 1 à 5 étoiles et une note perso par famille (panneau de droite ou clic droit). Tri « Note ».
+- **Tri « Ajout récent »** et date d'installation dans le panneau de droite.
+- **Vue grille** : bouton ▦ Grille / ☰ Liste.
+- **Textes d'aperçu enregistrés** : liste déroulante, + pour enregistrer le texte en cours, − pour le retirer.

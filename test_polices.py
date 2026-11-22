@@ -85,3 +85,38 @@ assert idx["roboto"]["site"] == "Google Fonts"  # Google passe avant Squirrel
 assert idx["freething"]["rights"] == "Domaine public" and idx["freething"]["site"] == "Fontsource"
 assert idx[p.norm("Lobster-Two")]["rights"] == "100% gratuite"
 print("ok web")
+
+# langues
+fr = [ord(c) for c in p.LANGS["Français"]] + list(range(32, 127))
+assert "Français" in p.langs_of(fr) and "Cyrillique" not in p.langs_of(fr)
+assert "Français" not in p.langs_of(range(32, 127))
+
+# polices d'un document (docx minimal) et correspondance
+import zipfile as _z
+tmp = tempfile.mkdtemp()
+docx = os.path.join(tmp, "a.docx")
+with _z.ZipFile(docx, "w") as z:
+    z.writestr("word/fontTable.xml", '<w:fonts><w:font w:name="Roboto"/><w:font w:name="Lobster Two"/></w:fonts>')
+    z.writestr("word/document.xml", '<w:rFonts w:ascii="Roboto" w:hAnsi="Roboto"/>')
+assert p.doc_font_names(docx) == ["Lobster Two", "Roboto"]
+html = os.path.join(tmp, "a.css")
+open(html, "w").write("h1 { font-family: 'Pacifico', cursive; }")
+assert p.doc_font_names(html) == ["Pacifico"]
+rob, rbb = p.FontInfo("r.ttf", "Roboto", "Regular", True), p.FontInfo("rc.ttf", "Roboto Condensed", "Regular", True)
+assert p.match_installed("ABCDEF+Roboto-BoldItalic".split("+")[1], [rob, rbb]) is rob
+assert p.match_installed("RobotoCondensed-Bold", [rob, rbb]) is rbb
+assert p.match_installed("Lobster Two", [rob]) is None
+
+# fichier cassé
+bad = os.path.join(tmp, "bad.ttf")
+open(bad, "wb").write(b"x" * 10)
+assert p.broken_reason(bad)
+
+# paires : un serif propose des sans complets
+t = p.FontInfo("t.ttf", "Playfair", "Regular", True); t.tags = {"Serif"}
+s1 = [p.FontInfo(f"s{i}.ttf", "Inter", st, True) for i, st in enumerate(("Regular", "Bold", "Italic"))]
+for x in s1: x.tags = {"Sans"}
+sc = p.FontInfo("sc.ttf", "Great Vibes", "Regular", True); sc.tags = {"Script"}
+assert [x.family for x in p.pair_candidates(t, [t] + s1 + [sc])] == ["Inter"]
+shutil.rmtree(tmp)
+print("ok v1.12")
