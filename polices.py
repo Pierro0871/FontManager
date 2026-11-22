@@ -52,6 +52,8 @@ PROTECTED = ("segoe", "arial", "times new roman", "courier new", "calibri", "cam
              "small fonts", "modern", "roman", "script", "courier", "system", "terminal", "fixedsys",
              "sitka", "bahnschrift", "ink free", "holomdl2", "sans serif collection")
 STYLES = ["Serif", "Sans", "Script", "Déco", "Mono", "Symbole", "Gras", "Italique"]
+# couleurs proposées pour les collections, dans l'ordre
+PALETTE = ["#e5484d", "#f76b15", "#e2a400", "#46a758", "#12a594", "#0090ff", "#6e56cf", "#d6409f", "#7c7c7c"]
 REG_PATH = r"Software\Microsoft\Windows NT\CurrentVersion\Fonts"
 ROW_H = 64
 VERSION = "dev"  # remplacé par le build GitHub (ex. 1.12)
@@ -94,6 +96,60 @@ def find_duplicates(fonts):
     for f in fonts:
         count[(f.family.lower(), f.style.lower())] = count.get((f.family.lower(), f.style.lower()), 0) + 1
     return {f.path for f in fonts if count[(f.family.lower(), f.style.lower())] > 1}
+
+
+def fam_key(fi):
+    return fi.family.lower()
+
+
+def family_paths(all_fonts, fonts):
+    """Chemins de toutes les polices des mêmes familles (Bold, Italic… suivent)."""
+    fams = {fam_key(x) for x in fonts}
+    return {x.path for x in all_fonts if fam_key(x) in fams} | {x.path for x in fonts}
+
+
+def rep_font(fonts):
+    """Police qui représente une famille : la Regular si elle existe."""
+    for x in fonts:
+        if x.style.lower() in ("regular", "normal", "book", "roman", ""):
+            return x
+    return next((x for x in fonts if "italic" not in x.style.lower()), fonts[0])
+
+
+def blend(c1, c2, t):
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+def text_on(color):
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return "#111111" if 0.299 * r + 0.587 * g + 0.114 * b > 165 else "#ffffff"
+
+
+class Row:
+    """Ligne de la liste : une famille (repliable) ou un fichier."""
+    __slots__ = ("key", "fonts", "fam", "child", "rep")
+
+    def __init__(self, key, fonts, fam, child=False):
+        self.key, self.fonts, self.fam, self.child = key, fonts, fam, child
+        self.rep = rep_font(fonts)
+
+
+def build_rows(fonts, expanded):
+    """Regroupe des polices déjà triées par famille, dans l'ordre d'arrivée."""
+    groups = {}
+    for x in fonts:
+        groups.setdefault(fam_key(x), []).append(x)
+    rows = []
+    for k, g in groups.items():
+        if len(g) == 1:
+            rows.append(Row(g[0].path, g, False))
+            continue
+        rows.append(Row("F:" + k, g, True))
+        if "F:" + k in expanded:
+            rows += [Row(x.path, [x], False, child=True) for x in g]
+    return rows
 
 
 def is_protected(family, user):
@@ -391,8 +447,11 @@ class App(BaseTk):
         set_theme(self.cfg.get("theme", "clair"))
         self.fonts, self.view = [], []
         self.cache = {}
-        self.sel = set()
+        self.sel = set()      # clés de lignes (famille "F:nom" ou chemin)
         self.anchor = None
+        self.rows, self.rowmap, self.colmap = [], {}, {}
+        self.expanded = set()
+        self.drag = None
 
         self.sample = tk.StringVar(value=self.cfg.get("sample", "Portez ce vieux whisky au juge blond qui fume"))
         self.size = tk.IntVar(value=self.cfg.get("size", 28))
@@ -419,6 +478,7 @@ class App(BaseTk):
         c.setdefault("favorites", [])
         c.setdefault("tags", {})
         c.setdefault("collections", {})
+        c.setdefault("col_colors", {})
         return c
 
     def save_cfg(self):
@@ -441,7 +501,7 @@ class App(BaseTk):
     def filter_values(self):
         return (["Toutes", "Favoris", "Installées par moi", "Système", "Doublons"]
                 + [f"Style : {s}" for s in STYLES]
-                + [f"📁 {c}" for c in sorted(self.cfg["collections"])])
+                + [f"📁 {c}" for c in self.cfg["collections"]])
 
     # -- construction
     def build_ui(self):
@@ -463,7 +523,7 @@ class App(BaseTk):
         top.pack(fill="x")
         ttk.Button(top, text="➕ Installer des polices…", style="Accent.TButton",
                    command=self.ask_install).pack(side="left")
-        for txt, cmd in (("⭐ Favori", self.toggle_fav), ("📁 Collection", self.collection_dialog),
+        for txt, cmd in (("⭐ Favori", self.toggle_fav),
                          ("⚖ Comparer", self.compare), ("⚡ Tri rapide", self.quick_sort),
                          ("🗑 Désinstaller", self.uninstall_sel), ("♻ Corbeille", self.trash_dialog),
                          ("💾 Exporter", self.export_sel), ("📂", self.open_folder), ("⟳", self.reload)):
@@ -498,6 +558,8 @@ class App(BaseTk):
 
         body = tk.PanedWindow(self, orient="horizontal", sashwidth=5, bg=LINE)
         body.pack(fill="both", expand=True)
+        self.side = tk.Frame(body, bg=BAR)
+        body.add(self.side, minsize=190, width=220)
 
         left = tk.Frame(body, bg=BG)
         self.canvas = tk.Canvas(left, bg=BG, highlightthickness=0)
@@ -523,8 +585,15 @@ class App(BaseTk):
         self.canvas.bind("<MouseWheel>", lambda e: self.scroll(-e.delta // 40))
         self.canvas.bind("<Button-4>", lambda e: self.scroll(-3))
         self.canvas.bind("<Button-5>", lambda e: self.scroll(3))
-        self.canvas.bind("<Button-1>", self.on_click)
-        self.canvas.bind("<Double-Button-1>", lambda e: self.toggle_fav())
+        self.canvas.bind("<Button-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Double-Button-1>", lambda e: None if self.hit_arrow(e) else self.toggle_fav())
+        self.canvas.bind("<Button-3>", self.row_menu)
+        for n in range(1, 10):
+            self.bind(f"<Key-{n}>", lambda e, n=n: None if self.typing() else self.toggle_in_col_n(n))
+        self.bind("<Right>", lambda e: None if self.typing() else self.expand(True))
+        self.bind("<Left>", lambda e: None if self.typing() else self.expand(False))
         self.bind("<Up>", lambda e: self.move(-1))
         self.bind("<Down>", lambda e: self.move(1))
         self.bind("<Prior>", lambda e: self.move(-8))
@@ -536,14 +605,20 @@ class App(BaseTk):
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", lambda e: self.after(10, self.install_paths, list(self.tk.splitlist(e.data))))
         self.protocol("WM_DELETE_WINDOW", lambda: (self.save_cfg(), self.destroy()))
+        self.build_side()
 
     # -- données
     def reload(self):
         self.count.config(text="Chargement des polices…")
-        def work():
-            fonts = scan_fonts()
-            self.after(0, lambda: self.loaded(fonts))
-        threading.Thread(target=work, daemon=True).start()
+        box = []
+        # Tk n'aime pas être appelé depuis un autre thread : on vérifie le résultat depuis la boucle principale
+        threading.Thread(target=lambda: box.append(scan_fonts()), daemon=True).start()
+        def poll():
+            if box:
+                self.loaded(box[0])
+            else:
+                self.after(100, poll)
+        poll()
 
     def loaded(self, fonts):
         self.fonts = fonts
@@ -554,7 +629,15 @@ class App(BaseTk):
     def apply_filter(self):
         q = self.search.get().lower().strip()
         f = self.filter.get()
-        v = [x for x in self.fonts if (not q or q in x.name.lower() or q in os.path.basename(x.path).lower())]
+        cols = self.cfg["collections"]
+        self.colmap = {}
+        for name, paths in cols.items():
+            for p in paths:
+                self.colmap.setdefault(p, []).append(name)
+        def match(x):
+            return (not q or q in x.name.lower() or q in os.path.basename(x.path).lower()
+                    or any(q in c.lower() for c in self.colmap.get(x.path, ())))
+        v = [x for x in self.fonts if match(x)]
         if f == "Favoris":
             v = [x for x in v if self.is_fav(x)]
         elif f == "Installées par moi":
@@ -567,19 +650,24 @@ class App(BaseTk):
         elif f.startswith("Style : "):
             v = [x for x in v if f[8:] in x.tags]
         elif f.startswith("📁 "):
-            members = set(self.cfg["collections"].get(f[2:], []))
+            members = set(cols.get(f[2:], []))
             v = [x for x in v if x.path in members]
-        key = {"Nom": lambda x: x.name.lower(),
-               "Type": lambda x: (x.ext, x.name.lower()),
+        key = {"Nom": lambda x: (x.family.lower(), x.style.lower()),
+               "Type": lambda x: (x.ext, x.family.lower()),
                "Fichier": lambda x: os.path.basename(x.path).lower(),
                "Taille": lambda x: -os.path.getsize(x.path) if os.path.exists(x.path) else 0}[self.sort.get()]
         v.sort(key=key)
         self.view = v
-        self.sel &= {x.path for x in v}
-        self.count.config(text=f"{len(v)} / {len(self.fonts)} polices")
+        self.rows = build_rows(v, self.expanded)
+        self.rowmap = {r.key: r for r in self.rows}
+        self.sel &= set(self.rowmap)
+        nfam = sum(1 for r in self.rows if not r.child)
+        self.count.config(text=f"{nfam} familles, {len(v)} fichiers")
         self.canvas.yview_moveto(0)
         self.draw()
         self.show_detail()
+        if hasattr(self, "side"):
+            self.build_side()
 
     # -- rendu
     def render(self, fi, text, size, width):
@@ -590,7 +678,9 @@ class App(BaseTk):
                 self.cache.clear()
             try:
                 font = ImageFont.truetype(fi.path, size)
-                im = Image.new("RGB", (width, int(size * 1.5)), self.pbg())
+                # fond transparent pour laisser voir la teinte de la collection, sauf couleur de fond choisie
+                bg = self.cfg.get("prev_bg")
+                im = Image.new("RGBA", (width, int(size * 1.5)), bg if bg else (0, 0, 0, 0))
                 ImageDraw.Draw(im).text((0, size * 0.15), text, font=font, fill=self.pfg())
             except Exception:
                 im = Image.new("RGB", (width, 20), BG)
@@ -613,35 +703,72 @@ class App(BaseTk):
         self.canvas.yview_scroll(n, "units")
         self.draw()
 
+    def col_color(self, name):
+        cols = list(self.cfg["collections"])
+        i = cols.index(name) if name in cols else 0
+        return self.cfg["col_colors"].get(name) or PALETTE[i % len(PALETTE)]
+
+    def row_cols(self, row):
+        seen = []
+        for x in row.fonts:
+            for c in self.colmap.get(x.path, ()):
+                if c not in seen:
+                    seen.append(c)
+        return [c for c in self.cfg["collections"] if c in seen]
+
     def draw(self):
         c = self.canvas
         c.delete("all")
         w, h, rh = max(c.winfo_width(), 300), c.winfo_height(), self.row_h()
-        total = len(self.view) * rh
-        c.configure(scrollregion=(0, 0, w, max(total, h)), yscrollincrement=rh // 3)
+        c.configure(scrollregion=(0, 0, w, max(len(self.rows) * rh, h)), yscrollincrement=rh // 3)
         top = c.canvasy(0)
         first, last = int(top // rh), int((top + h) // rh) + 1
         text, size = self.sample.get() or "Aa", self.size.get()
-        for i in range(max(0, first), min(len(self.view), last + 1)):
-            fi, y = self.view[i], i * rh
-            if fi.path in self.sel:
+        for i in range(max(0, first), min(len(self.rows), last + 1)):
+            row, y = self.rows[i], i * rh
+            cols = self.row_cols(row)
+            x0 = 40 if row.child else 14
+            if row.key in self.sel:
                 c.create_rectangle(0, y, w, y + rh, fill=SEL, width=0)
+            elif cols:  # fond légèrement teinté par la 1re collection
+                c.create_rectangle(0, y, w, y + rh, fill=blend(BG, self.col_color(cols[0]), 0.10), width=0)
+            if cols:  # bande à gauche, un segment par collection
+                seg = rh / len(cols)
+                for k, cn in enumerate(cols):
+                    c.create_rectangle(0, y + k * seg, 6, y + (k + 1) * seg, fill=self.col_color(cn), width=0)
             c.create_line(0, y + rh - 1, w, y + rh - 1, fill=LINE)
-            star = "⭐ " if self.is_fav(fi) else ""
-            tag = "" if fi.user else "  · système"
-            c.create_text(12, y + 6, anchor="nw", text=f"{star}{fi.name}{tag}",
-                          fill=MUTED, font=("Segoe UI", 9))
-            c.create_image(12, y + 22, anchor="nw", image=self.render(fi, text, size, w - 24))
-        if not self.view:
-            c.create_text(w // 2, 60, text="Aucune police", fill=MUTED, font=("Segoe UI", 12))
+            label = row.rep.family if row.fam else row.fonts[0].name
+            if row.fam:
+                arrow = "▾" if row.key in self.expanded else "▸"
+                c.create_text(x0, y + 6, anchor="nw", text=arrow, fill=FG, font=("Segoe UI", 10, "bold"))
+                label += f"   {len(row.fonts)} styles"
+                x0 += 18
+            if any(self.is_fav(x) for x in row.fonts):
+                label = "⭐ " + label
+            if not row.rep.user:
+                label += "   système"
+            t = c.create_text(x0, y + 6, anchor="nw", text=label, fill=MUTED, font=("Segoe UI", 9))
+            px = c.bbox(t)[2] + 14
+            for cn in cols:  # pastilles + nom de la collection
+                col = self.col_color(cn)
+                c.create_oval(px, y + 9, px + 10, y + 19, fill=col, width=0)
+                tt = c.create_text(px + 14, y + 6, anchor="nw", text=cn, fill=col, font=("Segoe UI", 9, "bold"))
+                px = c.bbox(tt)[2] + 12
+            c.create_image(x0, y + 22, anchor="nw", image=self.render(row.rep, text, size, w - x0 - 12))
+        if not self.rows:
+            c.create_text(w // 2, 60, text="Aucune police ne correspond. Videz la recherche ou changez de filtre.",
+                          fill=MUTED, font=("Segoe UI", 11))
 
     def show_detail(self):
-        fi = next((x for x in self.view if x.path == self.anchor), None)
+        row = self.rowmap.get(self.anchor)
+        fi = row.rep if row else None
         if not fi:
             self.d_title.config(text="Sélectionnez une police")
-            self.d_info.config(text="Clic = sélection · Ctrl/Maj+clic = multi-sélection\n"
-                                    "Double-clic ou F = favori · Suppr = désinstaller\n"
-                                    "Ctrl+C = copier le nom · filtre Doublons = fichiers en double")
+            self.d_info.config(text="Cliquez une police pour la voir en détail.\n\n"
+                                    "Ctrl ou Maj + clic pour en choisir plusieurs.\n"
+                                    "Touches 1 à 9 : ranger dans la collection du même numéro.\n"
+                                    "Glissez une police sur un bouton de collection pour l'y ranger.\n"
+                                    "F ou double-clic : favori. Suppr : désinstaller. Ctrl+C : copier le nom.")
             self.d_img.config(image="")
             self.d_lic.config(text="")
             return
@@ -649,7 +776,7 @@ class App(BaseTk):
             kb = os.path.getsize(fi.path) // 1024
         except OSError:
             kb = "?"
-        self.d_title.config(text=fi.name)
+        self.d_title.config(text=fi.family if row.fam else fi.name)
         self.d_info.config(text=f"{os.path.basename(fi.path)} · {kb} Ko · {fi.ext[1:].upper()}\n"
                                 f"{'Installée pour vous' if fi.user else 'Police système'}"
                                 f"{' · 🔒 protégée' if is_protected(fi.family, fi.user) else ''}\n"
@@ -678,41 +805,110 @@ class App(BaseTk):
         self.d_img.config(image=self._detail)
 
     # -- sélection
-    def on_click(self, e):
-        self.canvas.focus_set()
+    def typing(self):
+        return isinstance(self.focus_get(), (ttk.Entry, tk.Entry))
+
+    def row_at(self, e):
         i = int(self.canvas.canvasy(e.y) // self.row_h())
-        if not 0 <= i < len(self.view):
+        return self.rows[i] if 0 <= i < len(self.rows) else None
+
+    def hit_arrow(self, e):
+        row = self.row_at(e)
+        return bool(row and row.fam and e.x < 34)
+
+    def on_press(self, e):
+        self.canvas.focus_set()
+        row = self.row_at(e)
+        self.drag = None
+        if not row:
             return
-        p = self.view[i].path
+        if self.hit_arrow(e):
+            self.expanded ^= {row.key}
+            self.anchor, self.sel = row.key, {row.key}
+            self.apply_filter_keep()
+            return
+        k = row.key
         if e.state & 0x0004:  # Ctrl
-            self.sel ^= {p}
-        elif e.state & 0x0001 and self.anchor:  # Maj
-            idx = [x.path for x in self.view]
-            a = idx.index(self.anchor) if self.anchor in idx else i
-            self.sel = set(idx[min(a, i):max(a, i) + 1])
+            self.sel ^= {k}
+            self.anchor = k
+        elif e.state & 0x0001 and self.anchor in self.rowmap:  # Maj
+            keys = [r.key for r in self.rows]
+            a, i = keys.index(self.anchor), keys.index(k)
+            self.sel = set(keys[min(a, i):max(a, i) + 1])
+        elif k in self.sel and len(self.sel) > 1:
+            # peut-être le début d'un glisser : on garde la sélection jusqu'au relâchement
+            self.drag = {"x": e.x, "y": e.y, "on": False, "pending": k}
+            return
         else:
-            self.sel = {p}
-        if not e.state & 0x0001:
-            self.anchor = p
+            self.sel, self.anchor = {k}, k
+        self.drag = {"x": e.x, "y": e.y, "on": False, "pending": None}
         self.draw()
         self.show_detail()
 
-    def move(self, d):
-        if isinstance(self.focus_get(), ttk.Entry) or not self.view:
+    def on_drag(self, e):
+        d = self.drag
+        if not d or not self.sel:
             return
-        idx = [x.path for x in self.view]
-        i = idx.index(self.anchor) + d if self.anchor in idx else 0
-        i = max(0, min(len(idx) - 1, i))
-        self.anchor, self.sel = idx[i], {idx[i]}
+        if not d["on"] and abs(e.x - d["x"]) + abs(e.y - d["y"]) > 10:
+            d["on"] = True
+            self.canvas.config(cursor="hand2")
+            n = len(self.selected())
+            self.count.config(text=f"Lâchez sur une collection pour y ranger {n} police(s)")
+
+    def on_release(self, e):
+        d, self.drag = self.drag, None
+        self.canvas.config(cursor="")
+        if not d:
+            return
+        if d["on"]:
+            w = self.winfo_containing(e.x_root, e.y_root)
+            while w is not None and not hasattr(w, "col_name"):
+                w = w.master
+            if w is not None:
+                self.add_to_col(w.col_name, self.selected())
+            else:
+                self.apply_filter_keep()
+        elif d["pending"]:
+            self.sel, self.anchor = {d["pending"]}, d["pending"]
+            self.draw()
+            self.show_detail()
+
+    def apply_filter_keep(self):
+        """Recalcule la liste sans perdre la position de défilement."""
+        y = self.canvas.yview()[0]
+        self.apply_filter()
+        self.canvas.yview_moveto(y)
+        self.draw()
+
+    def expand(self, open_):
+        row = self.rowmap.get(self.anchor)
+        if row and row.fam and (row.key in self.expanded) != open_:
+            self.expanded ^= {row.key}
+            self.apply_filter_keep()
+
+    def move(self, d):
+        if self.typing() or not self.rows:
+            return
+        keys = [r.key for r in self.rows]
+        i = keys.index(self.anchor) + d if self.anchor in keys else 0
+        i = max(0, min(len(keys) - 1, i))
+        self.anchor, self.sel = keys[i], {keys[i]}
         rh, h = self.row_h(), self.canvas.winfo_height()
         top = self.canvas.canvasy(0)
         if i * rh < top or (i + 1) * rh > top + h:
-            self.canvas.yview_moveto(max(0, i * rh - h / 3) / max(1, len(idx) * rh))
+            self.canvas.yview_moveto(max(0, i * rh - h / 3) / max(1, len(keys) * rh))
         self.draw()
         self.show_detail()
 
     def selected(self):
-        return [x for x in self.view if x.path in self.sel]
+        out, seen = [], set()
+        for r in self.rows:
+            if r.key in self.sel:
+                for x in r.fonts:
+                    if x.path not in seen:
+                        seen.add(x.path)
+                        out.append(x)
+        return out
 
     # -- actions
     def toggle_fav(self):
@@ -812,17 +1008,222 @@ class App(BaseTk):
         self.cache.clear()
         self.refresh_previews()
 
-    def collection_dialog(self):
+    def build_side(self):
+        """Colonne de gros boutons : un par collection."""
+        for w in self.side.winfo_children():
+            w.destroy()
+        cols = self.cfg["collections"]
+        present = {x.path: x for x in self.fonts}
+        active = self.filter.get()
+        tk.Label(self.side, text="Collections", bg=BAR, fg=FG, font=("Segoe UI", 13, "bold"),
+                 anchor="w").pack(fill="x", padx=12, pady=(12, 8))
+
+        def big(text, bg, fg, cmd, on):
+            b = tk.Button(self.side, text=text, bg=bg, fg=fg, activebackground=blend(bg, "#000000", 0.15),
+                          activeforeground=fg, relief="flat", bd=0, anchor="w", justify="left",
+                          font=("Segoe UI", 11, "bold"), padx=14, pady=8, cursor="hand2", command=cmd,
+                          highlightthickness=3 if on else 0, highlightbackground=FG, highlightcolor=FG)
+            b.pack(fill="x", padx=10, pady=3)
+            return b
+
+        big(f"Toutes les polices\n{len({fam_key(x) for x in self.fonts})} familles", FIELD, FG,
+            lambda: self.filter.set("Toutes"), active == "Toutes")
+        for i, (name, paths) in enumerate(cols.items()):
+            col = self.col_color(name)
+            fams = {fam_key(present[p]) for p in paths if p in present}
+            num = f"{i + 1}   " if i < 9 else ""
+            b = big(f"{num}{name}\n{len(fams)} famille{'s' if len(fams) > 1 else ''}", col, text_on(col),
+                    lambda n=name: self.filter.set(f"📁 {n}"), active == f"📁 {name}")
+            b.col_name = name
+            b.bind("<Button-3>", lambda e, n=name: self.col_menu(e, n))
+        add = tk.Button(self.side, text="+  Nouvelle collection", bg=BAR, fg=ACC, relief="flat", bd=0,
+                        activebackground=LINE, activeforeground=ACC, anchor="w", font=("Segoe UI", 11),
+                        padx=14, pady=8, cursor="hand2", command=lambda: self.new_collection(self.selected()))
+        add.pack(fill="x", padx=10, pady=(6, 0))
+        if not cols:
+            tk.Label(self.side, bg=BAR, fg=MUTED, justify="left", wraplength=180, anchor="w",
+                     text="Créez une collection, puis rangez-y des polices avec les touches 1 à 9, "
+                          "le clic droit ou en les glissant sur son bouton.").pack(fill="x", padx=14, pady=10)
+        elif hasattr(self, "filter_box"):
+            self.filter_box.config(values=self.filter_values())
+
+    def cols_changed(self, msg=""):
+        self.save_cfg()
+        self.filter_box.config(values=self.filter_values())
+        self.apply_filter_keep()
+        if msg:
+            self.count.config(text=msg)
+
+    def add_to_col(self, name, fonts):
+        if not fonts:
+            return
+        paths = family_paths(self.fonts, fonts)
+        cur = set(self.cfg["collections"].get(name, []))
+        self.cfg["collections"][name] = sorted(cur | paths)
+        self.cols_changed(f"{len(paths - cur)} fichier(s) ajouté(s) à « {name} »")
+
+    def remove_from_col(self, name, fonts):
+        paths = family_paths(self.fonts, fonts)
+        cur = set(self.cfg["collections"].get(name, []))
+        self.cfg["collections"][name] = sorted(cur - paths)
+        self.cols_changed(f"{len(cur & paths)} fichier(s) retiré(s) de « {name} »")
+
+    def in_col(self, name, fonts):
+        cur = set(self.cfg["collections"].get(name, []))
+        return bool(fonts) and all(x.path in cur for x in fonts)
+
+    def toggle_in_col(self, name, fonts):
+        (self.remove_from_col if self.in_col(name, fonts) else self.add_to_col)(name, fonts)
+
+    def toggle_in_col_n(self, n):
+        cols = list(self.cfg["collections"])
         sel = self.selected()
         if not sel:
-            messagebox.showinfo("Collection", "Sélectionnez d'abord une ou plusieurs polices.")
             return
-        CollectionDialog(self, sel)
-        self.filter_box.config(values=self.filter_values())
-        self.apply_filter()
+        if n <= len(cols):
+            self.toggle_in_col(cols[n - 1], sel)
+        elif n == len(cols) + 1:
+            self.new_collection(sel)
+
+    def new_collection(self, fonts=()):
+        from tkinter import simpledialog
+        name = simpledialog.askstring("Nouvelle collection", "Nom de la collection :", parent=self)
+        name = (name or "").strip()
+        if not name:
+            return
+        cols = self.cfg["collections"]
+        if name in cols:
+            messagebox.showinfo("Collection", f"« {name} » existe déjà.")
+            return
+        cols[name] = []
+        self.cfg["col_colors"][name] = PALETTE[(len(cols) - 1) % len(PALETTE)]
+        if fonts:
+            self.add_to_col(name, list(fonts))
+        else:
+            self.cols_changed(f"Collection « {name} » créée")
+
+    def row_menu(self, e):
+        row = self.row_at(e)
+        if not row:
+            return
+        if row.key not in self.sel:
+            self.sel, self.anchor = {row.key}, row.key
+            self.draw()
+            self.show_detail()
+        sel = self.selected()
+        m = tk.Menu(self, tearoff=0)
+        for i, name in enumerate(self.cfg["collections"]):
+            var = tk.BooleanVar(value=self.in_col(name, sel))
+            m.add_checkbutton(label=f"{name}" + (f"      {i + 1}" if i < 9 else ""), variable=var,
+                              command=lambda n=name: self.toggle_in_col(n, sel))
+            m._vars = getattr(m, "_vars", []) + [var]
+        m.add_command(label="Nouvelle collection avec cette sélection…", command=lambda: self.new_collection(sel))
+        m.add_separator()
+        m.add_command(label="Favori", command=self.toggle_fav)
+        m.add_command(label="Comparer", command=self.compare)
+        m.add_command(label="Tous les caractères", command=self.charmap)
+        m.add_command(label="Copier le nom", command=self.copy_names)
+        m.add_separator()
+        m.add_command(label="Désinstaller…", command=self.uninstall_sel)
+        m.tk_popup(e.x_root, e.y_root)
+
+    def col_fonts(self, name):
+        cur = set(self.cfg["collections"].get(name, []))
+        return [x for x in self.fonts if x.path in cur]
+
+    def col_menu(self, e, name):
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Afficher", command=lambda: self.filter.set(f"📁 {name}"))
+        m.add_command(label="Ranger la sélection ici", command=lambda: self.add_to_col(name, self.selected()))
+        m.add_separator()
+        m.add_command(label="Renommer…", command=lambda: self.rename_col(name))
+        m.add_command(label="Changer la couleur…", command=lambda: self.recolor_col(name))
+        m.add_separator()
+        m.add_command(label="Exporter en zip…", command=lambda: self.zip_col(name))
+        m.add_command(label="Réinstaller depuis la corbeille", command=lambda: self.restore_col(name))
+        m.add_command(label="Désinstaller toutes ses polices…", command=lambda: self.uninstall_sel(self.col_fonts(name)))
+        m.add_separator()
+        m.add_command(label="Vider la collection", command=lambda: self.clear_col(name))
+        m.add_command(label="Supprimer la collection", command=lambda: self.drop_col(name))
+        m.tk_popup(e.x_root, e.y_root)
+
+    def rename_col(self, old):
+        from tkinter import simpledialog
+        new = (simpledialog.askstring("Renommer", "Nouveau nom :", initialvalue=old, parent=self) or "").strip()
+        cols = self.cfg["collections"]
+        if not new or new == old or new in cols:
+            return
+        self.cfg["collections"] = {(new if k == old else k): v for k, v in cols.items()}
+        cc = self.cfg["col_colors"]
+        if old in cc:
+            cc[new] = cc.pop(old)
+        if self.filter.get() == f"📁 {old}":
+            self.filter.set(f"📁 {new}")
+        self.cols_changed(f"« {old} » renommée en « {new} »")
+
+    def recolor_col(self, name):
+        c = colorchooser.askcolor(color=self.col_color(name), parent=self)[1]
+        if c:
+            self.cfg["col_colors"][name] = c
+            self.cols_changed()
+
+    def clear_col(self, name):
+        if messagebox.askyesno("Vider", f"Retirer toutes les polices de « {name} » ?\nElles restent installées."):
+            self.cfg["collections"][name] = []
+            self.cols_changed(f"« {name} » vidée")
+
+    def drop_col(self, name):
+        if messagebox.askyesno("Supprimer", f"Supprimer la collection « {name} » ?\nLes polices restent installées."):
+            self.cfg["collections"].pop(name, None)
+            self.cfg["col_colors"].pop(name, None)
+            if self.filter.get() == f"📁 {name}":
+                self.filter.set("Toutes")
+            self.cols_changed(f"Collection « {name} » supprimée")
+
+    def zip_col(self, name):
+        fonts = self.col_fonts(name)
+        if not fonts:
+            messagebox.showinfo("Exporter", f"« {name} » ne contient aucune police installée.")
+            return
+        dest = filedialog.asksaveasfilename(title="Exporter en zip", defaultextension=".zip",
+                                            initialfile=f"{name}.zip", filetypes=[("Zip", "*.zip")])
+        if not dest:
+            return
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+            used = set()
+            for x in fonts:
+                arc = os.path.basename(x.path)
+                while arc in used:
+                    arc = "_" + arc
+                used.add(arc)
+                z.write(x.path, arc)
+        messagebox.showinfo("Exporter", f"{len(fonts)} fichier(s) dans\n{dest}")
+
+    def restore_col(self, name):
+        cur = set(self.cfg["collections"].get(name, []))
+        idx = trash_index()
+        keys = [k for k, v in idx.items() if v.get("path") in cur]
+        if not keys:
+            messagebox.showinfo("Corbeille", f"Aucune police de « {name} » dans la corbeille.")
+            return
+        done = []
+        for k in keys:
+            try:
+                fi = restore_from_trash(k)
+            except Exception as e:
+                messagebox.showerror("Corbeille", f"{idx[k]['name']} : {e}")
+                continue
+            if fi:
+                done.append(fi)
+                cur.discard(idx[k]["path"])
+                cur.add(fi.path)
+        notify_font_change()
+        self.fonts += done
+        self.cfg["collections"][name] = sorted(cur)
+        self.cols_changed(f"{len(done)} police(s) réinstallée(s) dans « {name} »")
 
     def compare(self):
-        sel = self.selected()
+        sel = [r.rep for r in self.rows if r.key in self.sel]
         if not 2 <= len(sel) <= 4:
             messagebox.showinfo("Comparer", "Sélectionnez 2 à 4 polices (Ctrl+clic).")
             return
@@ -831,12 +1232,12 @@ class App(BaseTk):
     def quick_sort(self):
         if not self.view:
             return
-        QuickSort(self, list(self.view))
+        QuickSort(self, [r.fonts for r in self.rows if not r.child])
 
     def charmap(self):
-        fi = next((x for x in self.view if x.path == self.anchor), None)
-        if fi:
-            CharMap(self, fi)
+        row = self.rowmap.get(self.anchor)
+        if row:
+            CharMap(self, row.rep)
 
     def trash_dialog(self):
         TrashDialog(self)
@@ -867,7 +1268,7 @@ class App(BaseTk):
         sel = self.selected()
         if sel:
             self.clipboard_clear()
-            self.clipboard_append("\n".join(x.family for x in sel))
+            self.clipboard_append("\n".join(dict.fromkeys(x.family for x in sel)))
             self.count.config(text=f"{len(sel)} nom(s) copié(s)")
 
     def export_sel(self):
@@ -892,19 +1293,28 @@ class App(BaseTk):
             if not silent:
                 messagebox.showinfo("Mise à jour", "Mise à jour automatique disponible seulement dans l'exe.")
             return
+        box = []
         def work():
             try:
-                tag, url = latest_release()
+                box.append(latest_release())
             except Exception as e:
+                box.append(e)
+        threading.Thread(target=work, daemon=True).start()
+        def poll():
+            if not box:
+                return self.after(200, poll)
+            res = box[0]
+            if isinstance(res, Exception):
                 if not silent:
-                    self.after(0, lambda: messagebox.showerror("Mise à jour", f"Pas de connexion à GitHub :\n{e}"))
+                    messagebox.showerror("Mise à jour", f"Pas de connexion à GitHub :\n{res}")
                 return
+            tag, url = res
             new = parse_version(tag)
             if new and url and new > cur:
-                self.after(0, lambda: self.offer_update(tag, url))
+                self.offer_update(tag, url)
             elif not silent:
-                self.after(0, lambda: messagebox.showinfo("Mise à jour", f"Vous avez déjà la dernière version (v{VERSION})."))
-        threading.Thread(target=work, daemon=True).start()
+                messagebox.showinfo("Mise à jour", f"Vous avez déjà la dernière version (v{VERSION}).")
+        poll()
 
     def offer_update(self, tag, url):
         if not messagebox.askyesno("Mise à jour", f"Nouvelle version {tag} disponible (vous : v{VERSION}).\n\nInstaller maintenant ?"):
@@ -953,40 +1363,6 @@ class Win(tk.Toplevel):
         self.transient(app)
 
 
-class CollectionDialog(Win):
-    def __init__(self, app, sel):
-        super().__init__(app, "Collections", "380x200")
-        self.sel = sel
-        cols = app.cfg["collections"]
-        tk.Label(self, text=f"{len(sel)} police(s) sélectionnée(s).\nCollection (choisir ou taper un nouveau nom) :",
-                 bg=BG, fg=FG, justify="left").pack(anchor="w", padx=12, pady=(12, 4))
-        self.name = tk.StringVar(value=app.filter.get()[2:] if app.filter.get().startswith("📁 ") else "")
-        ttk.Combobox(self, textvariable=self.name, values=sorted(cols), width=36).pack(padx=12, anchor="w")
-        b = tk.Frame(self, bg=BG)
-        b.pack(fill="x", padx=12, pady=14)
-        ttk.Button(b, text="➕ Ajouter", style="Accent.TButton", command=lambda: self.do("add")).pack(side="left")
-        ttk.Button(b, text="➖ Retirer", command=lambda: self.do("del")).pack(side="left", padx=6)
-        ttk.Button(b, text="🗑 Supprimer la collection", command=lambda: self.do("drop")).pack(side="left")
-        self.grab_set()
-        self.wait_window()
-
-    def do(self, what):
-        n = self.name.get().strip()
-        if not n:
-            return
-        cols = self.app.cfg["collections"]
-        if what == "drop":
-            if n in cols and messagebox.askyesno("Collection", f"Supprimer la collection « {n} » ?\n(les polices restent installées)", parent=self):
-                del cols[n]
-        else:
-            s = set(cols.get(n, []))
-            paths = {x.path for x in self.sel}
-            s = s | paths if what == "add" else s - paths
-            cols[n] = sorted(s)
-        self.app.save_cfg()
-        self.destroy()
-
-
 class CompareWindow(Win):
     def __init__(self, app, fonts):
         super().__init__(app, "Comparer", "1000x560")
@@ -1030,9 +1406,9 @@ class CompareWindow(Win):
 class QuickSort(Win):
     """← jeter · → garder · ↑ favori · Retour arrière = annuler."""
 
-    def __init__(self, app, fonts):
-        super().__init__(app, "Tri rapide", "1000x560")
-        self.fonts, self.i, self.hist, self.trash = fonts, 0, [], []
+    def __init__(self, app, groups):
+        super().__init__(app, "Tri rapide", "1000x580")
+        self.groups, self.i, self.hist, self.trash = groups, 0, [], []
         self.info = tk.Label(self, bg=BG, fg=MUTED, font=("Segoe UI", 11))
         self.info.pack(pady=(10, 0))
         self.title_l = tk.Label(self, bg=BG, fg=FG, font=("Segoe UI", 16, "bold"))
@@ -1040,23 +1416,36 @@ class QuickSort(Win):
         self.img = tk.Label(self, bg=BG)
         self.img.pack(fill="both", expand=True, padx=20)
         tk.Label(self, bg=BG, fg=MUTED, font=("Segoe UI", 11),
-                 text="←  jeter      →  garder      ↑  favori      ⌫  annuler      Échap  terminer").pack(pady=10)
+                 text="←  jeter      →  garder      ↑  favori      1 à 9  ranger dans une collection"
+                      "      ⌫  annuler      Échap  terminer").pack(pady=10)
         self.bind("<Left>", lambda e: self.act("trash"))
         self.bind("<Right>", lambda e: self.act("keep"))
         self.bind("<Up>", lambda e: self.act("fav"))
         self.bind("<BackSpace>", lambda e: self.undo())
         self.bind("<Escape>", lambda e: self.finish())
+        for n in range(1, 10):
+            self.bind(f"<Key-{n}>", lambda e, n=n: self.to_col(n))
         self.protocol("WM_DELETE_WINDOW", self.finish)
         self.focus_force()
         self.show()
 
+    def to_col(self, n):
+        cols = list(self.app.cfg["collections"])
+        if self.i < len(self.groups) and n <= len(cols):
+            self.app.add_to_col(cols[n - 1], self.groups[self.i])
+            self.show()
+
     def show(self):
-        if self.i >= len(self.fonts):
+        if self.i >= len(self.groups):
             return self.finish()
-        fi = self.fonts[self.i]
+        g = self.groups[self.i]
+        fi = rep_font(g)
         lock = "  🔒 protégée" if is_protected(fi.family, fi.user) else ""
-        self.info.config(text=f"{self.i + 1} / {len(self.fonts)}  ·  {len(self.trash)} à jeter")
-        self.title_l.config(text=fi.name + ("  ⭐" if self.app.is_fav(fi) else "") + lock)
+        cols = [c for c in self.app.cfg["collections"] if self.app.in_col(c, g)]
+        self.info.config(text=f"{self.i + 1} sur {len(self.groups)}, {len(self.trash)} à jeter"
+                              + (f"      dans : {', '.join(cols)}" if cols else ""))
+        styles = f"   {len(g)} styles" if len(g) > 1 else ""
+        self.title_l.config(text=fi.family + styles + ("  ⭐" if any(self.app.is_fav(x) for x in g) else "") + lock)
         W = 940
         im = Image.new("RGB", (W, 380), self.app.pbg())
         d = ImageDraw.Draw(im)
@@ -1072,25 +1461,25 @@ class QuickSort(Win):
         self.img.config(image=self._img)
 
     def act(self, what):
-        if self.i >= len(self.fonts):
+        if self.i >= len(self.groups):
             return
-        fi = self.fonts[self.i]
-        self.hist.append((what, fi))
+        g = self.groups[self.i]
+        added = [x.path for x in g if not self.app.is_fav(x)] if what == "fav" else []
+        self.hist.append((what, g, added))
         if what == "trash":
-            self.trash.append(fi)
-        elif what == "fav" and not self.app.is_fav(fi):
-            self.app.cfg["favorites"].append(fi.path)
+            self.trash += g
+        self.app.cfg["favorites"] += added
         self.i += 1
         self.show()
 
     def undo(self):
         if not self.hist:
             return
-        what, fi = self.hist.pop()
+        what, g, added = self.hist.pop()
         if what == "trash":
-            self.trash.remove(fi)
-        elif what == "fav" and fi.path in self.app.cfg["favorites"]:
-            self.app.cfg["favorites"].remove(fi.path)
+            self.trash = self.trash[:-len(g)]
+        for p in added:
+            self.app.cfg["favorites"].remove(p)
         self.i -= 1
         self.show()
 
@@ -1098,7 +1487,7 @@ class QuickSort(Win):
         self.app.save_cfg()
         trash = self.trash
         self.destroy()
-        self.app.draw()
+        self.app.apply_filter_keep()
         if trash:
             self.app.uninstall_sel(trash)
 

@@ -39,3 +39,19 @@ Télécharger l'exe : https://github.com/Pierro0871/FontManager/releases/latest
 - **Licence** : auteur, licence, intégration et usage commercial (deviné depuis le texte de licence : à vérifier).
 - **♻ Corbeille** : les polices désinstallées sont gardées, bouton Restaurer.
 - **🔒 Protection** : les polices dont Windows a besoin (Segoe, Arial, Calibri…) ne peuvent pas être supprimées.
+
+## Collections (v1.7)
+La colonne de gauche montre une grosse case de couleur par collection, avec son nombre de familles. Un clic affiche seulement cette collection.
+
+Pour ranger une police :
+- touche **1 à 9** : met la sélection dans la collection du même numéro, ou l'en retire si elle y est déjà ;
+- **clic droit** sur une police : cocher les collections, ou en créer une ;
+- **glisser** une police sur la case d'une collection.
+
+Toute la famille suit : ranger Roboto range aussi Roboto Bold, Italic, Light.
+
+La liste montre une ligne par famille ; la flèche ▸ (ou la touche →) affiche ses styles. Chaque police rangée porte la couleur de sa collection : bande à gauche, fond teinté, pastille avec le nom.
+
+Clic droit sur une case de collection : renommer, changer la couleur, exporter en zip, réinstaller depuis la corbeille, tout désinstaller, vider, supprimer.
+
+Le tri rapide marche par famille ; les touches 1 à 9 y rangent aussi la famille affichée.

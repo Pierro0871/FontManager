@@ -44,3 +44,19 @@ p.restore_from_trash(key)
 assert os.listdir(p.USER_FONTS) and not p.trash_index()
 shutil.rmtree(tmp)
 print("ok tout")
+
+# familles : regroupement, dépliage, la famille suit
+r = p.FontInfo("r.ttf", "Roboto", "Regular", True)
+rb = p.FontInfo("rb.ttf", "Roboto", "Bold", True)
+ri = p.FontInfo("ri.ttf", "Roboto", "Italic", True)
+lo = p.FontInfo("lo.ttf", "Lobster", "Regular", True)
+rows = p.build_rows([rb, r, ri, lo], set())
+assert [x.key for x in rows] == ["F:roboto", "lo.ttf"] and rows[0].rep is r
+rows = p.build_rows([rb, r, ri, lo], {"F:roboto"})
+assert [x.key for x in rows] == ["F:roboto", "rb.ttf", "r.ttf", "ri.ttf", "lo.ttf"] and rows[1].child
+assert p.family_paths([r, rb, ri, lo], [rb]) == {"r.ttf", "rb.ttf", "ri.ttf"}
+
+# couleurs
+assert p.blend("#000000", "#ffffff", 0.5) == "#808080"
+assert p.text_on("#ffffff") == "#111111" and p.text_on("#6e56cf") == "#ffffff"
+print("ok familles")
