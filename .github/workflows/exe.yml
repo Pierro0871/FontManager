@@ -14,7 +14,7 @@ jobs:
       - name: Numéro de version
         shell: bash
         run: sed -i 's/^VERSION = "dev"/VERSION = "1.${{ github.run_number }}"/' polices.py && grep '^VERSION' polices.py
-      - run: pyinstaller --onefile --windowed --name GestionnairePolices --collect-all tkinterdnd2 polices.py
+      - run: pyinstaller --onefile --windowed --name GestionnairePolices --collect-all tkinterdnd2 --icon icon.ico --add-data "icon.ico;." polices.py
       - uses: actions/upload-artifact@v4
         with: { name: GestionnairePolices, path: dist/GestionnairePolices.exe }
       - uses: softprops/action-gh-release@v2

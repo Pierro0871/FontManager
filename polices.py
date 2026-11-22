@@ -380,6 +380,10 @@ class App(BaseTk):
     def __init__(self):
         super().__init__()
         self.title("Gestionnaire de polices")
+        try:  # même plume que l'exe (dans l'exe, les fichiers sont dans sys._MEIPASS)
+            self.iconbitmap(os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "icon.ico"))
+        except Exception:
+            pass
         self.geometry("1150x720")
         self.minsize(800, 500)
         self.configure(bg=BG)
