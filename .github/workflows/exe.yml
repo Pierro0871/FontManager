@@ -1,0 +1,17 @@
+name: Build exe
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyinstaller pillow rarfile
+      - run: pyinstaller --onefile --windowed --name GestionnairePolices polices.py
+      - uses: actions/upload-artifact@v4
+        with: { name: GestionnairePolices, path: dist/GestionnairePolices.exe }
+      - uses: softprops/action-gh-release@v2
+        with: { tag_name: latest, name: GestionnairePolices, files: dist/GestionnairePolices.exe }
