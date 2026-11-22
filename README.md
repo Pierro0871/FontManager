@@ -68,3 +68,7 @@ Chaque police porte un badge de couleur avec ses droits, classés comme sur DaFo
 - Le panneau de droite explique ce que la catégorie permet.
 
 Le classement est deviné à partir du texte de licence rangé dans le fichier. Pour un projet client, vérifiez sur le site de l'auteur.
+
+## v1.10
+- Les polices de Windows sont cachées par défaut. Cochez « Polices Windows » pour les revoir. Le filtre « Système » les montre toujours.
+- Après une désinstallation, la liste reste à sa place et la police suivante est sélectionnée.

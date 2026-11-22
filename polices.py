@@ -556,6 +556,12 @@ class App(BaseTk):
     def is_fav(self, fi):
         return fi.path in self.cfg["favorites"]
 
+    def pool(self):
+        """Polices prises en compte : sans celles de Windows si elles sont masquées."""
+        if self.cfg.get("hide_system", True) and self.filter.get() != "Système":
+            return [x for x in self.fonts if x.user]
+        return self.fonts
+
     def pfg(self):
         return self.cfg.get("prev_fg") or FG
 
@@ -616,6 +622,9 @@ class App(BaseTk):
         tk.Label(bar, text=" Tri :", bg=BAR, fg=FG).pack(side="left")
         ttk.Combobox(bar, textvariable=self.sort, state="readonly", width=10,
                      values=["Nom", "Droits", "Type", "Fichier", "Taille"]).pack(side="left", padx=4)
+        self.show_sys = tk.BooleanVar(value=not self.cfg.get("hide_system", True))
+        tk.Checkbutton(bar, text="Polices Windows", variable=self.show_sys, bg=BAR, fg=FG, selectcolor=FIELD,
+                       activebackground=BAR, activeforeground=FG, command=self.toggle_system).pack(side="left", padx=(10, 0))
         tk.Label(bar, text="  Couleurs :", bg=BAR, fg=FG).pack(side="left")
         ttk.Button(bar, text="A", width=2, command=lambda: self.pick_color("prev_fg")).pack(side="left", padx=2)
         ttk.Button(bar, text="▇", width=2, command=lambda: self.pick_color("prev_bg")).pack(side="left", padx=2)
@@ -702,9 +711,9 @@ class App(BaseTk):
         def match(x):
             return (not q or q in x.name.lower() or q in os.path.basename(x.path).lower()
                     or any(q in c.lower() for c in self.colmap.get(x.path, ())))
-        v = [x for x in self.fonts if match(x)]
+        v = [x for x in self.pool() if match(x)]
         if f == "Non rangées":
-            ranged = {fam_key(x) for x in self.fonts if x.path in self.colmap}
+            ranged = {fam_key(x) for x in self.pool() if x.path in self.colmap}
             v = [x for x in v if fam_key(x) not in ranged]
         elif f == "Favoris":
             v = [x for x in v if self.is_fav(x)]
@@ -1006,9 +1015,10 @@ class App(BaseTk):
 
     def apply_filter_keep(self):
         """Recalcule la liste sans perdre la position de défilement."""
-        y = self.canvas.yview()[0]
+        top = self.canvas.canvasy(0)  # en pixels : la liste peut avoir raccourci
         self.apply_filter()
-        self.canvas.yview_moveto(y)
+        total = max(1, len(self.rows) * self.row_h())
+        self.canvas.yview_moveto(top / total)
         self.draw()
 
     def expand(self, open_):
@@ -1069,6 +1079,8 @@ class App(BaseTk):
         if not messagebox.askyesno("Désinstaller", f"Désinstaller {len(sel)} police(s) ?\n"
                                    f"(elles iront dans la corbeille ♻)\n\n{names}{warn}"):
             return
+        keys = [r.key for r in self.rows]
+        pos = keys.index(self.anchor) if self.anchor in keys else 0
         errs = []
         for x in sel:
             try:
@@ -1079,7 +1091,12 @@ class App(BaseTk):
         notify_font_change()
         self.sel.clear()
         self.cache.clear()
-        self.apply_filter()
+        self.apply_filter_keep()  # garde la position au lieu de remonter en haut
+        if self.rows:
+            nxt = self.rows[min(pos, len(self.rows) - 1)].key
+            self.sel, self.anchor = {nxt}, nxt
+            self.draw()
+            self.show_detail()
         if errs:
             messagebox.showwarning("Certaines polices n'ont pas été supprimées",
                                    "\n".join(errs[:10]) + "\n\n(Une police en cours d'utilisation peut nécessiter "
@@ -1139,12 +1156,18 @@ class App(BaseTk):
         self.cache.clear()
         self.refresh_previews()
 
+    def toggle_system(self):
+        self.cfg["hide_system"] = not self.show_sys.get()
+        self.save_cfg()
+        self.apply_filter()
+
     def build_side(self):
         """Colonne de gros boutons : un par collection."""
         for w in self.side.winfo_children():
             w.destroy()
         cols = self.cfg["collections"]
-        present = {x.path: x for x in self.fonts}
+        pool = self.pool()
+        present = {x.path: x for x in pool}
         active = self.filter.get()
         tk.Label(self.side, text="Collections", bg=BAR, fg=FG, font=("Segoe UI", 13, "bold"),
                  anchor="w").pack(fill="x", padx=12, pady=(12, 8))
@@ -1157,10 +1180,10 @@ class App(BaseTk):
             b.pack(fill="x", padx=10, pady=3)
             return b
 
-        big(f"Toutes les polices\n{len({fam_key(x) for x in self.fonts})} familles", FIELD, FG,
+        big(f"Toutes les polices\n{len({fam_key(x) for x in pool})} familles", FIELD, FG,
             lambda: self.filter.set("Toutes"), active == "Toutes")
-        ranged = {fam_key(x) for x in self.fonts if x.path in self.colmap}
-        loose = len({fam_key(x) for x in self.fonts} - ranged)
+        ranged = {fam_key(x) for x in pool if x.path in self.colmap}
+        loose = len({fam_key(x) for x in pool} - ranged)
         big(f"Non rangées\n{loose} famille{'s' if loose > 1 else ''} à trier", blend(FIELD, ACC, 0.18), FG,
             lambda: self.filter.set("Non rangées"), active == "Non rangées")
         for i, (name, paths) in enumerate(cols.items()):
