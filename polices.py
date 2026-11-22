@@ -182,15 +182,58 @@ def classify(family, style, panose_family=0, panose_serif=0, fixed=False, weight
     return tags
 
 
-def commercial_status(text):
+# catégories de droits, de la plus libre à la plus restreinte (classement façon DaFont)
+RIGHTS = [
+    ("Domaine public", "#46a758", "Usage libre, même commercial, sans condition."),
+    ("Libre (OFL, Apache…)", "#46a758", "Usage commercial permis. Vous ne pouvez pas revendre la police seule."),
+    ("100% gratuite", "#12a594", "Annoncée gratuite, même pour un usage commercial."),
+    ("Fournie par Windows", "#0090ff", "Licence Microsoft : usage avec Windows et ses logiciels."),
+    ("Donationware", "#e2a400", "Gratuite, un don à l'auteur est demandé."),
+    ("Shareware", "#f76b15", "Essai gratuit, à payer si vous l'utilisez."),
+    ("Usage personnel", "#f76b15", "Interdite en usage commercial sans licence."),
+    ("Démo", "#e5484d", "Version incomplète, il faut acheter la version complète."),
+    ("Commerciale", "#6e56cf", "Police payante, sous licence."),
+    ("Inconnue", "#7c7c7c", "Rien de clair dans le fichier : vérifiez sur le site de l'auteur."),
+]
+RIGHTS_ORDER = {name: i for i, (name, _, _) in enumerate(RIGHTS)}
+RIGHTS_COLOR = {name: c for name, c, _ in RIGHTS}
+RIGHTS_HELP = {name: h for name, _, h in RIGHTS}
+
+
+def rights_category(text, user=True):
+    """Devine la catégorie de droits depuis le texte de licence (à vérifier)."""
     t = text.lower()
-    if any(k in t for k in ("personal use", "non-commercial", "noncommercial", "non commercial", "demo",
-                            "usage personnel", "for personal", "not for commercial")):
-        return "⚠ Usage personnel seulement (à vérifier)"
-    if any(k in t for k in ("open font license", "ofl", "apache license", "public domain", "cc0",
-                            "ubuntu font licence", "mit license", "free for commercial")):
-        return "✅ Libre — usage commercial permis"
-    return "❓ Inconnu — vérifier la licence"
+    has = lambda *ks: any(k in t for k in ks)
+    if has("demo", "démo", "trial version", "incomplete"):
+        return "Démo"
+    if has("shareware"):
+        return "Shareware"
+    if has("donationware", "donation", "paypal", "buy me a coffee"):
+        return "Donationware"
+    if has("personal use", "non-commercial", "noncommercial", "non commercial", "usage personnel",
+           "for personal", "not for commercial", "personal purposes"):
+        return "Usage personnel"
+    if has("open font license", "ofl", "apache license", "ubuntu font licence", "mit license",
+           "gnu general public", "gpl", "bitstream vera", "creative commons attribution"):
+        return "Libre (OFL, Apache…)"
+    if has("public domain", "domaine public", "cc0"):
+        return "Domaine public"
+    if has("100% free", "free for commercial", "free for personal and commercial", "freeware"):
+        return "100% gratuite"
+    if not user and has("microsoft", "windows"):
+        return "Fournie par Windows"
+    if has("purchase", "license fee", "licensed to", "commercial license", "buy a license", "eula"):
+        return "Commerciale"
+    return "Inconnue"
+
+
+def commercial_status(text):
+    cat = rights_category(text)
+    if cat in ("Domaine public", "Libre (OFL, Apache…)", "100% gratuite"):
+        return "✅ Usage commercial permis"
+    if cat in ("Usage personnel", "Démo", "Shareware"):
+        return "⚠ Pas d'usage commercial sans licence (à vérifier)"
+    return "❓ Inconnu, vérifiez la licence"
 
 
 def font_tables(path):
@@ -208,6 +251,15 @@ def font_style_tags(path, family, style):
                         os2.usWeightClass if os2 else 400)
     except Exception:
         return classify(family, style)
+
+
+def font_rights(path, user):
+    try:
+        name = font_tables(path)["name"]
+        txt = " ".join(str(name.getDebugName(i) or "") for i in (0, 1, 7, 8, 9, 10, 11, 13, 14))
+    except Exception:
+        return "Inconnue"
+    return rights_category(txt, user)
 
 
 def font_license(path):
@@ -230,7 +282,7 @@ def font_license(path):
     lic = get(13)
     info = {"Auteur": get(9) or get(8), "Copyright": get(0), "Licence": lic, "Lien": get(14),
             "Intégration": embed,
-            "Commercial": commercial_status(" ".join((lic, get(0), get(1), get(14))))}
+            "Commercial": commercial_status(" ".join((lic, get(0), get(1), get(7), get(10), get(14))))}
     return {k: v for k, v in info.items() if v}
 
 
@@ -289,12 +341,13 @@ def empty_trash(keys):
 
 # ---------------------------------------------------------------- polices
 class FontInfo:
-    __slots__ = ("path", "family", "style", "user", "ext", "tags")
+    __slots__ = ("path", "family", "style", "user", "ext", "tags", "rights")
 
     def __init__(self, path, family, style, user):
         self.path, self.family, self.style, self.user = path, family, style, user
         self.ext = os.path.splitext(path)[1].lower()
         self.tags = set()
+        self.rights = "Inconnue"
 
     @property
     def name(self):
@@ -307,6 +360,7 @@ def read_font(path, user):
         fam, sty = f.getname()
         fi = FontInfo(path, fam or os.path.basename(path), sty or "", user)
         fi.tags = font_style_tags(path, fi.family, fi.style)
+        fi.rights = font_rights(path, user)
         return fi
     except Exception:
         return None
@@ -511,6 +565,7 @@ class App(BaseTk):
     def filter_values(self):
         return (["Toutes", "Non rangées", "Favoris", "Installées par moi", "Système", "Doublons"]
                 + [f"Style : {s}" for s in STYLES]
+                + [f"Droits : {r}" for r, _, _ in RIGHTS]
                 + [f"📁 {c}" for c in self.cfg["collections"]])
 
     # -- construction
@@ -560,7 +615,7 @@ class App(BaseTk):
         self.filter_box.pack(side="left")
         tk.Label(bar, text=" Tri :", bg=BAR, fg=FG).pack(side="left")
         ttk.Combobox(bar, textvariable=self.sort, state="readonly", width=10,
-                     values=["Nom", "Type", "Fichier", "Taille"]).pack(side="left", padx=4)
+                     values=["Nom", "Droits", "Type", "Fichier", "Taille"]).pack(side="left", padx=4)
         tk.Label(bar, text="  Couleurs :", bg=BAR, fg=FG).pack(side="left")
         ttk.Button(bar, text="A", width=2, command=lambda: self.pick_color("prev_fg")).pack(side="left", padx=2)
         ttk.Button(bar, text="▇", width=2, command=lambda: self.pick_color("prev_bg")).pack(side="left", padx=2)
@@ -660,6 +715,8 @@ class App(BaseTk):
         elif f == "Doublons":
             dups = find_duplicates(self.fonts)
             v = [x for x in v if x.path in dups]
+        elif f.startswith("Droits : "):
+            v = [x for x in v if x.rights == f[9:]]
         elif f.startswith("Style : "):
             v = [x for x in v if f[8:] in x.tags]
         elif f.startswith("📁 "):
@@ -668,6 +725,7 @@ class App(BaseTk):
         key = {"Nom": lambda x: (x.family.lower(), x.style.lower()),
                "Type": lambda x: (x.ext, x.family.lower()),
                "Fichier": lambda x: os.path.basename(x.path).lower(),
+               "Droits": lambda x: (RIGHTS_ORDER.get(x.rights, 99), x.family.lower(), x.style.lower()),
                "Taille": lambda x: -os.path.getsize(x.path) if os.path.exists(x.path) else 0}[self.sort.get()]
         v.sort(key=key)
         self.view = v
@@ -762,6 +820,13 @@ class App(BaseTk):
                 label += "   système"
             t = c.create_text(x0, y + 6, anchor="nw", text=label, fill=MUTED, font=("Segoe UI", 9))
             px = c.bbox(t)[2] + 14
+            rc = RIGHTS_COLOR.get(row.rep.rights, MUTED)  # badge des droits, façon DaFont
+            bt = c.create_text(px + 6, y + 6, anchor="nw", text=row.rep.rights, fill=text_on(rc),
+                               font=("Segoe UI", 8, "bold"))
+            bx = c.bbox(bt)
+            bg_ = c.create_rectangle(bx[0] - 6, bx[1] - 1, bx[2] + 6, bx[3] + 1, fill=rc, width=0)
+            c.tag_lower(bg_, bt)
+            px = bx[2] + 18
             for cn in cols:  # pastilles + nom de la collection
                 col = self.col_color(cn)
                 c.create_oval(px, y + 9, px + 10, y + 19, fill=col, width=0)
@@ -795,7 +860,9 @@ class App(BaseTk):
                                 f"{' · 🔒 protégée' if is_protected(fi.family, fi.user) else ''}\n"
                                 f"Style : {', '.join(sorted(fi.tags)) or '?'}\n{fi.path}")
         lic = font_license(fi.path)
-        self.d_lic.config(text="\n".join(f"{k} : {v[:160]}" for k, v in lic.items()))
+        self.d_lic.config(text=f"Droits : {fi.rights}. {RIGHTS_HELP.get(fi.rights, '')}\n"
+                               + "\n".join(f"{k} : {v[:160]}" for k, v in lic.items()),
+                          fg=FG)
         W = 360
         im = Image.new("RGB", (W, 900), self.pbg())
         d = ImageDraw.Draw(im)

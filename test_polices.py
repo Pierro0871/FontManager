@@ -60,3 +60,16 @@ assert p.family_paths([r, rb, ri, lo], [rb]) == {"r.ttf", "rb.ttf", "ri.ttf"}
 assert p.blend("#000000", "#ffffff", 0.5) == "#808080"
 assert p.text_on("#ffffff") == "#111111" and p.text_on("#6e56cf") == "#ffffff"
 print("ok familles")
+
+# droits façon DaFont
+rc = p.rights_category
+assert rc("This font is licensed under the SIL Open Font License") == "Libre (OFL, Apache…)"
+assert rc("Free for personal use only. Contact me for commercial license") == "Usage personnel"
+assert rc("DEMO version - buy the full font") == "Démo"
+assert rc("This font is donationware, paypal me") == "Donationware"
+assert rc("Released into the public domain") == "Domaine public"
+assert rc("© Microsoft Corporation", user=False) == "Fournie par Windows"
+assert rc("© Microsoft Corporation", user=True) == "Inconnue"
+assert rc("") == "Inconnue"
+assert all(r in p.RIGHTS_ORDER for r in ("Démo", "Inconnue"))
+print("ok droits")
