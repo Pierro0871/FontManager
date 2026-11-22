@@ -27,3 +27,15 @@ Astuce : glisser des `.zip`/`.ttf` sur `Lancer.bat` les propose directement à l
 - **Ctrl+C** : copie le nom des polices sélectionnées.
 
 Télécharger l'exe : https://github.com/Pierro0871/FontManager/releases/latest
+
+## Version 3
+- **Glisser-déposer** des .ttf/.otf/.zip/.rar directement dans la fenêtre.
+- **📁 Collections** : vos groupes (« Logo », « Projet X »…), filtre « 📁 nom ».
+- **⚡ Tri rapide** : une police à la fois — ← jeter, → garder, ↑ favori, ⌫ annuler, Échap terminer.
+- **Filtre Style** : Serif, Sans, Script, Déco, Mono, Symbole, Gras, Italique (détection auto, pas toujours juste).
+- **⚖ Comparer** 2 à 4 polices côte à côte (Ctrl+clic pour sélectionner).
+- **Couleurs de l'aperçu** : boutons A (texte), ▇ (fond), ↺ (par défaut).
+- **🔤 Tous les caractères** : grille de tous les signes, clic = copier.
+- **Licence** : auteur, licence, intégration et usage commercial (deviné depuis le texte de licence : à vérifier).
+- **♻ Corbeille** : les polices désinstallées sont gardées, bouton Restaurer.
+- **🔒 Protection** : les polices dont Windows a besoin (Segoe, Arial, Calibri…) ne peuvent pas être supprimées.

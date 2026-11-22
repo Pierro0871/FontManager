@@ -15,7 +15,14 @@ import tempfile
 import threading
 import zipfile
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
+
+try:  # glisser-déposer (optionnel)
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    BaseTk = TkinterDnD.Tk
+except Exception:
+    TkinterDnD = None
+    BaseTk = tk.Tk
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -28,11 +35,23 @@ if IS_WIN:
     SYS_FONTS = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
     USER_FONTS = os.path.join(os.environ["LOCALAPPDATA"], "Microsoft", "Windows", "Fonts")
     CONFIG = os.path.join(os.environ["APPDATA"], "GestionnairePolices.json")
+    TRASH = os.path.join(os.environ["APPDATA"], "GestionnairePolices", "Corbeille")
 else:  # pour tester sous Linux/Mac
     SYS_FONTS = "/usr/share/fonts"
     USER_FONTS = os.path.expanduser("~/.local/share/fonts")
     CONFIG = os.path.expanduser("~/.gestionnaire_polices.json")
+    TRASH = os.path.expanduser("~/.gestionnaire_polices_corbeille")
 
+# polices dont Windows a besoin : on refuse de les supprimer
+PROTECTED = ("segoe", "arial", "times new roman", "courier new", "calibri", "cambria", "candara",
+             "consolas", "constantia", "corbel", "tahoma", "verdana", "georgia", "trebuchet",
+             "marlett", "symbol", "webdings", "wingdings", "microsoft sans serif", "ms sans serif",
+             "ms serif", "lucida console", "lucida sans", "malgun", "microsoft yahei", "microsoft jhenghei",
+             "yu gothic", "ms gothic", "ms mincho", "simsun", "nsimsun", "gadugi", "ebrima", "nirmala",
+             "leelawadee", "myanmar text", "javanese text", "sylfaen", "mongolian baiti", "mv boli",
+             "small fonts", "modern", "roman", "script", "courier", "system", "terminal", "fixedsys",
+             "sitka", "bahnschrift", "ink free", "holomdl2", "sans serif collection")
+STYLES = ["Serif", "Sans", "Script", "Déco", "Mono", "Symbole", "Gras", "Italique"]
 REG_PATH = r"Software\Microsoft\Windows NT\CurrentVersion\Fonts"
 ROW_H = 64
 VERSION = "dev"  # remplacé par le build GitHub (ex. 1.12)
@@ -77,13 +96,145 @@ def find_duplicates(fonts):
     return {f.path for f in fonts if count[(f.family.lower(), f.style.lower())] > 1}
 
 
+def is_protected(family, user):
+    return not user and family.lower().startswith(PROTECTED)
+
+
+def classify(family, style, panose_family=0, panose_serif=0, fixed=False, weight=400):
+    """Devine les styles d'une police (pas toujours juste)."""
+    n, tags = f"{family} {style}".lower(), set()
+    if fixed or any(k in n for k in ("mono", "code", "console", "courier", "typewriter")):
+        tags.add("Mono")
+    if panose_family == 5 or any(k in n for k in ("symbol", "dings", "icon", "emoji", "marlett")):
+        tags.add("Symbole")
+    elif panose_family == 3 or any(k in n for k in ("script", "hand", "brush", "signature", "calligra", "pen ")):
+        tags.add("Script")
+    elif panose_family == 4 or any(k in n for k in ("display", "deco", "stencil", "grunge", "comic")):
+        tags.add("Déco")
+    elif "sans" in n or 11 <= panose_serif <= 15:
+        tags.add("Sans")
+    elif "serif" in n or 2 <= panose_serif <= 10:
+        tags.add("Serif")
+    if weight >= 600 or any(k in n for k in ("bold", "black", "heavy", "gras")):
+        tags.add("Gras")
+    if any(k in n for k in ("italic", "oblique", "italique")):
+        tags.add("Italique")
+    return tags
+
+
+def commercial_status(text):
+    t = text.lower()
+    if any(k in t for k in ("personal use", "non-commercial", "noncommercial", "non commercial", "demo",
+                            "usage personnel", "for personal", "not for commercial")):
+        return "⚠ Usage personnel seulement (à vérifier)"
+    if any(k in t for k in ("open font license", "ofl", "apache license", "public domain", "cc0",
+                            "ubuntu font licence", "mit license", "free for commercial")):
+        return "✅ Libre — usage commercial permis"
+    return "❓ Inconnu — vérifier la licence"
+
+
+def font_tables(path):
+    from fontTools.ttLib import TTFont
+    return TTFont(path, fontNumber=0, lazy=True)
+
+
+def font_style_tags(path, family, style):
+    try:
+        f = font_tables(path)
+        os2 = f["OS/2"] if "OS/2" in f else None
+        pan = os2.panose if os2 else None
+        return classify(family, style, pan.bFamilyType if pan else 0, pan.bSerifStyle if pan else 0,
+                        bool(f["post"].isFixedPitch) if "post" in f else False,
+                        os2.usWeightClass if os2 else 400)
+    except Exception:
+        return classify(family, style)
+
+
+def font_license(path):
+    """Auteur, licence et droits d'intégration lus dans la police."""
+    try:
+        f = font_tables(path)
+        name = f["name"]
+        get = lambda i: str(name.getDebugName(i) or "").strip()
+        fs = f["OS/2"].fsType if "OS/2" in f else 0
+    except Exception as e:
+        return {"Erreur": str(e)}
+    if fs & 0x2 and not fs & 0xC:
+        embed = "Restreinte (intégration interdite)"
+    elif fs & 0x4:
+        embed = "Aperçu & impression seulement"
+    elif fs & 0x8:
+        embed = "Intégrable (modifiable)"
+    else:
+        embed = "Installable (aucune restriction)"
+    lic = get(13)
+    info = {"Auteur": get(9) or get(8), "Copyright": get(0), "Licence": lic, "Lien": get(14),
+            "Intégration": embed,
+            "Commercial": commercial_status(" ".join((lic, get(0), get(1), get(14))))}
+    return {k: v for k, v in info.items() if v}
+
+
+def font_chars(path):
+    try:
+        cmap = font_tables(path).getBestCmap() or {}
+        return sorted(c for c in cmap if c >= 32)
+    except Exception:
+        return []
+
+
+# ---- corbeille
+def trash_index():
+    try:
+        with open(os.path.join(TRASH, "index.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_trash_index(idx):
+    os.makedirs(TRASH, exist_ok=True)
+    with open(os.path.join(TRASH, "index.json"), "w", encoding="utf-8") as f:
+        json.dump(idx, f, ensure_ascii=False, indent=1)
+
+
+def move_to_trash(fi):
+    import time
+    os.makedirs(TRASH, exist_ok=True)
+    dest = os.path.join(TRASH, f"{int(time.time() * 1000)}_{os.path.basename(fi.path)}")
+    shutil.move(fi.path, dest)
+    idx = trash_index()
+    idx[os.path.basename(dest)] = {"name": fi.name, "path": fi.path, "date": time.strftime("%d/%m/%Y %H:%M")}
+    save_trash_index(idx)
+
+
+def restore_from_trash(key):
+    idx = trash_index()
+    fi = install_font(os.path.join(TRASH, key))
+    os.remove(os.path.join(TRASH, key))
+    idx.pop(key, None)
+    save_trash_index(idx)
+    return fi
+
+
+def empty_trash(keys):
+    idx = trash_index()
+    for k in keys:
+        try:
+            os.remove(os.path.join(TRASH, k))
+        except OSError:
+            pass
+        idx.pop(k, None)
+    save_trash_index(idx)
+
+
 # ---------------------------------------------------------------- polices
 class FontInfo:
-    __slots__ = ("path", "family", "style", "user", "ext")
+    __slots__ = ("path", "family", "style", "user", "ext", "tags")
 
     def __init__(self, path, family, style, user):
         self.path, self.family, self.style, self.user = path, family, style, user
         self.ext = os.path.splitext(path)[1].lower()
+        self.tags = set()
 
     @property
     def name(self):
@@ -94,7 +245,9 @@ def read_font(path, user):
     try:
         f = ImageFont.truetype(path, 12)
         fam, sty = f.getname()
-        return FontInfo(path, fam or os.path.basename(path), sty or "", user)
+        fi = FontInfo(path, fam or os.path.basename(path), sty or "", user)
+        fi.tags = font_style_tags(path, fi.family, fi.style)
+        return fi
     except Exception:
         return None
 
@@ -163,7 +316,7 @@ def uninstall_font(fi):
                     winreg.DeleteValue(k, name)
         except PermissionError:
             raise PermissionError("Police système : relancez le logiciel en administrateur.")
-    os.remove(fi.path)
+    move_to_trash(fi)
 
 
 def find_7z():
@@ -213,7 +366,7 @@ def collect_fonts(paths, tmp):
 
 
 # ---------------------------------------------------------------- interface
-class App(tk.Tk):
+class App(BaseTk):
     def __init__(self):
         super().__init__()
         self.title("Gestionnaire de polices")
@@ -250,6 +403,7 @@ class App(tk.Tk):
             c = {}
         c.setdefault("favorites", [])
         c.setdefault("tags", {})
+        c.setdefault("collections", {})
         return c
 
     def save_cfg(self):
@@ -262,6 +416,17 @@ class App(tk.Tk):
 
     def is_fav(self, fi):
         return fi.path in self.cfg["favorites"]
+
+    def pfg(self):
+        return self.cfg.get("prev_fg") or FG
+
+    def pbg(self):
+        return self.cfg.get("prev_bg") or BG
+
+    def filter_values(self):
+        return (["Toutes", "Favoris", "Installées par moi", "Système", "Doublons"]
+                + [f"Style : {s}" for s in STYLES]
+                + [f"📁 {c}" for c in sorted(self.cfg["collections"])])
 
     # -- construction
     def build_ui(self):
@@ -283,11 +448,11 @@ class App(tk.Tk):
         top.pack(fill="x")
         ttk.Button(top, text="➕ Installer des polices…", style="Accent.TButton",
                    command=self.ask_install).pack(side="left")
-        ttk.Button(top, text="⭐ Favori", command=self.toggle_fav).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="🗑 Désinstaller", command=self.uninstall_sel).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="📂 Ouvrir le dossier", command=self.open_folder).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="💾 Exporter…", command=self.export_sel).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="⟳", width=3, command=self.reload).pack(side="left", padx=(8, 0))
+        for txt, cmd in (("⭐ Favori", self.toggle_fav), ("📁 Collection", self.collection_dialog),
+                         ("⚖ Comparer", self.compare), ("⚡ Tri rapide", self.quick_sort),
+                         ("🗑 Désinstaller", self.uninstall_sel), ("♻ Corbeille", self.trash_dialog),
+                         ("💾 Exporter", self.export_sel), ("📂", self.open_folder), ("⟳", self.reload)):
+            ttk.Button(top, text=txt, command=cmd).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="🌙" if self.cfg.get("theme") != "sombre" else "☀", width=3,
                    command=self.toggle_theme).pack(side="right", padx=(8, 0))
         ttk.Button(top, text="⬆ Mise à jour", command=lambda: self.check_update(False)).pack(side="right", padx=(8, 0))
@@ -305,11 +470,16 @@ class App(tk.Tk):
         tk.Label(bar, textvariable=self.size, bg=BAR, fg=FG, width=3).pack(side="left", padx=(0, 12))
         tk.Label(bar, text="🔍", bg=BAR, fg=FG).pack(side="left")
         ttk.Entry(bar, textvariable=self.search, width=18).pack(side="left", padx=(2, 12))
-        ttk.Combobox(bar, textvariable=self.filter, state="readonly", width=16,
-                     values=["Toutes", "Favoris", "Installées par moi", "Système", "Doublons"]).pack(side="left")
+        self.filter_box = ttk.Combobox(bar, textvariable=self.filter, state="readonly", width=18,
+                                       values=self.filter_values())
+        self.filter_box.pack(side="left")
         tk.Label(bar, text=" Tri :", bg=BAR, fg=FG).pack(side="left")
         ttk.Combobox(bar, textvariable=self.sort, state="readonly", width=10,
                      values=["Nom", "Type", "Fichier", "Taille"]).pack(side="left", padx=4)
+        tk.Label(bar, text="  Couleurs :", bg=BAR, fg=FG).pack(side="left")
+        ttk.Button(bar, text="A", width=2, command=lambda: self.pick_color("prev_fg")).pack(side="left", padx=2)
+        ttk.Button(bar, text="▇", width=2, command=lambda: self.pick_color("prev_bg")).pack(side="left", padx=2)
+        ttk.Button(bar, text="↺", width=2, command=lambda: self.pick_color(None)).pack(side="left", padx=2)
 
         body = tk.PanedWindow(self, orient="horizontal", sashwidth=5, bg=LINE)
         body.pack(fill="both", expand=True)
@@ -326,7 +496,10 @@ class App(tk.Tk):
         self.d_title = tk.Label(right, bg=BG, fg=FG, font=("Segoe UI", 14, "bold"), anchor="w", wraplength=330, justify="left")
         self.d_title.pack(fill="x")
         self.d_info = tk.Label(right, bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=330)
-        self.d_info.pack(fill="x", pady=(2, 8))
+        self.d_info.pack(fill="x", pady=(2, 4))
+        self.d_lic = tk.Label(right, bg=BG, fg=FG, anchor="w", justify="left", wraplength=330)
+        self.d_lic.pack(fill="x", pady=(0, 4))
+        ttk.Button(right, text="🔤 Tous les caractères", command=self.charmap).pack(anchor="w", pady=(0, 8))
         self.d_img = tk.Label(right, bg=BG, anchor="nw")
         self.d_img.pack(fill="both", expand=True)
         body.add(right, minsize=300, width=380)
@@ -344,6 +517,9 @@ class App(tk.Tk):
         self.bind("<Delete>", lambda e: self.uninstall_sel() if self.focus_get() == self.canvas or not isinstance(self.focus_get(), ttk.Entry) else None)
         self.bind("<f>", lambda e: None if isinstance(self.focus_get(), ttk.Entry) else self.toggle_fav())
         self.bind("<Control-c>", lambda e: None if isinstance(self.focus_get(), ttk.Entry) else self.copy_names())
+        if TkinterDnD:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", lambda e: self.after(10, self.install_paths, list(self.tk.splitlist(e.data))))
         self.protocol("WM_DELETE_WINDOW", lambda: (self.save_cfg(), self.destroy()))
 
     # -- données
@@ -373,6 +549,11 @@ class App(tk.Tk):
         elif f == "Doublons":
             dups = find_duplicates(self.fonts)
             v = [x for x in v if x.path in dups]
+        elif f.startswith("Style : "):
+            v = [x for x in v if f[8:] in x.tags]
+        elif f.startswith("📁 "):
+            members = set(self.cfg["collections"].get(f[2:], []))
+            v = [x for x in v if x.path in members]
         key = {"Nom": lambda x: x.name.lower(),
                "Type": lambda x: (x.ext, x.name.lower()),
                "Fichier": lambda x: os.path.basename(x.path).lower(),
@@ -394,8 +575,8 @@ class App(tk.Tk):
                 self.cache.clear()
             try:
                 font = ImageFont.truetype(fi.path, size)
-                im = Image.new("RGB", (width, int(size * 1.5)), BG)
-                ImageDraw.Draw(im).text((0, size * 0.15), text, font=font, fill=FG)
+                im = Image.new("RGB", (width, int(size * 1.5)), self.pbg())
+                ImageDraw.Draw(im).text((0, size * 0.15), text, font=font, fill=self.pfg())
             except Exception:
                 im = Image.new("RGB", (width, 20), BG)
                 ImageDraw.Draw(im).text((0, 3), "(aperçu impossible)", fill="#a00")
@@ -447,6 +628,7 @@ class App(tk.Tk):
                                     "Double-clic ou F = favori · Suppr = désinstaller\n"
                                     "Ctrl+C = copier le nom · filtre Doublons = fichiers en double")
             self.d_img.config(image="")
+            self.d_lic.config(text="")
             return
         try:
             kb = os.path.getsize(fi.path) // 1024
@@ -454,22 +636,26 @@ class App(tk.Tk):
             kb = "?"
         self.d_title.config(text=fi.name)
         self.d_info.config(text=f"{os.path.basename(fi.path)} · {kb} Ko · {fi.ext[1:].upper()}\n"
-                                f"{'Installée pour vous' if fi.user else 'Police système'}\n{fi.path}")
+                                f"{'Installée pour vous' if fi.user else 'Police système'}"
+                                f"{' · 🔒 protégée' if is_protected(fi.family, fi.user) else ''}\n"
+                                f"Style : {', '.join(sorted(fi.tags)) or '?'}\n{fi.path}")
+        lic = font_license(fi.path)
+        self.d_lic.config(text="\n".join(f"{k} : {v[:160]}" for k, v in lic.items()))
         W = 360
-        im = Image.new("RGB", (W, 900), BG)
+        im = Image.new("RGB", (W, 900), self.pbg())
         d = ImageDraw.Draw(im)
         y = 0
         try:
             sample = self.sample.get() or "Aa"
             for s in (64, 40, 24, 16, 12):
                 f = ImageFont.truetype(fi.path, s)
-                d.text((0, y), "Aa Bb Cc" if s == 64 else sample, font=f, fill=FG)
+                d.text((0, y), "Aa Bb Cc" if s == 64 else sample, font=f, fill=self.pfg())
                 y += int(s * 1.45)
             f = ImageFont.truetype(fi.path, 20)
             for line in ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz",
                          "0123456789 àéèêçùôœ", "&@€$%?!«»()[]{}#*+-=/"):
                 y += 6
-                d.text((0, y), line, font=f, fill=FG)
+                d.text((0, y), line, font=f, fill=self.pfg())
                 y += 28
         except Exception as e:
             d.text((0, y), f"Erreur : {e}", fill="#a00")
@@ -526,14 +712,20 @@ class App(tk.Tk):
         self.save_cfg()
         self.draw()
 
-    def uninstall_sel(self):
-        sel = self.selected()
+    def uninstall_sel(self, sel=None):
+        sel = self.selected() if sel is None else sel
+        prot = [x for x in sel if is_protected(x.family, x.user)]
+        sel = [x for x in sel if x not in prot]
+        if prot:
+            messagebox.showwarning("Polices protégées", f"{len(prot)} police(s) de Windows protégée(s), non supprimée(s) :\n"
+                                   + "\n".join("• " + x.name for x in prot[:10]))
         if not sel:
             return
         names = "\n".join("• " + x.name for x in sel[:15]) + ("\n…" if len(sel) > 15 else "")
         nsys = sum(not x.user for x in sel)
         warn = f"\n\n⚠ {nsys} police(s) système : droits administrateur nécessaires." if nsys else ""
-        if not messagebox.askyesno("Désinstaller", f"Désinstaller {len(sel)} police(s) ?\n\n{names}{warn}"):
+        if not messagebox.askyesno("Désinstaller", f"Désinstaller {len(sel)} police(s) ?\n"
+                                   f"(elles iront dans la corbeille ♻)\n\n{names}{warn}"):
             return
         errs = []
         for x in sel:
@@ -591,6 +783,48 @@ class App(tk.Tk):
             messagebox.showinfo("Terminé", f"{len(done)} police(s) installée(s).")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def pick_color(self, key):
+        if key is None:
+            self.cfg.pop("prev_fg", None)
+            self.cfg.pop("prev_bg", None)
+        else:
+            c = colorchooser.askcolor(color=self.cfg.get(key) or (FG if key == "prev_fg" else BG), parent=self)[1]
+            if not c:
+                return
+            self.cfg[key] = c
+        self.save_cfg()
+        self.cache.clear()
+        self.refresh_previews()
+
+    def collection_dialog(self):
+        sel = self.selected()
+        if not sel:
+            messagebox.showinfo("Collection", "Sélectionnez d'abord une ou plusieurs polices.")
+            return
+        CollectionDialog(self, sel)
+        self.filter_box.config(values=self.filter_values())
+        self.apply_filter()
+
+    def compare(self):
+        sel = self.selected()
+        if not 2 <= len(sel) <= 4:
+            messagebox.showinfo("Comparer", "Sélectionnez 2 à 4 polices (Ctrl+clic).")
+            return
+        CompareWindow(self, sel)
+
+    def quick_sort(self):
+        if not self.view:
+            return
+        QuickSort(self, list(self.view))
+
+    def charmap(self):
+        fi = next((x for x in self.view if x.path == self.anchor), None)
+        if fi:
+            CharMap(self, fi)
+
+    def trash_dialog(self):
+        TrashDialog(self)
 
     def toggle_theme(self):
         self.cfg["theme"] = "clair" if self.cfg.get("theme") == "sombre" else "sombre"
@@ -679,6 +913,269 @@ class App(tk.Tk):
                 os.startfile(USER_FONTS)
 
 
+class Win(tk.Toplevel):
+    def __init__(self, app, title, geom):
+        super().__init__(app)
+        self.app = app
+        self.title(title)
+        self.geometry(geom)
+        self.configure(bg=BG)
+        self.transient(app)
+
+
+class CollectionDialog(Win):
+    def __init__(self, app, sel):
+        super().__init__(app, "Collections", "380x200")
+        self.sel = sel
+        cols = app.cfg["collections"]
+        tk.Label(self, text=f"{len(sel)} police(s) sélectionnée(s).\nCollection (choisir ou taper un nouveau nom) :",
+                 bg=BG, fg=FG, justify="left").pack(anchor="w", padx=12, pady=(12, 4))
+        self.name = tk.StringVar(value=app.filter.get()[2:] if app.filter.get().startswith("📁 ") else "")
+        ttk.Combobox(self, textvariable=self.name, values=sorted(cols), width=36).pack(padx=12, anchor="w")
+        b = tk.Frame(self, bg=BG)
+        b.pack(fill="x", padx=12, pady=14)
+        ttk.Button(b, text="➕ Ajouter", style="Accent.TButton", command=lambda: self.do("add")).pack(side="left")
+        ttk.Button(b, text="➖ Retirer", command=lambda: self.do("del")).pack(side="left", padx=6)
+        ttk.Button(b, text="🗑 Supprimer la collection", command=lambda: self.do("drop")).pack(side="left")
+        self.grab_set()
+        self.wait_window()
+
+    def do(self, what):
+        n = self.name.get().strip()
+        if not n:
+            return
+        cols = self.app.cfg["collections"]
+        if what == "drop":
+            if n in cols and messagebox.askyesno("Collection", f"Supprimer la collection « {n} » ?\n(les polices restent installées)", parent=self):
+                del cols[n]
+        else:
+            s = set(cols.get(n, []))
+            paths = {x.path for x in self.sel}
+            s = s | paths if what == "add" else s - paths
+            cols[n] = sorted(s)
+        self.app.save_cfg()
+        self.destroy()
+
+
+class CompareWindow(Win):
+    def __init__(self, app, fonts):
+        super().__init__(app, "Comparer", "1000x560")
+        self.fonts = fonts
+        self.text = tk.StringVar(value=app.sample.get() or "Aa")
+        self.size = tk.IntVar(value=max(app.size.get(), 32))
+        bar = tk.Frame(self, bg=BAR, padx=10, pady=6)
+        bar.pack(fill="x")
+        ttk.Entry(bar, textvariable=self.text, width=50).pack(side="left")
+        ttk.Scale(bar, from_=12, to=120, variable=self.size, length=160,
+                  command=lambda v: self.size.set(int(float(v)))).pack(side="left", padx=10)
+        self.lbl = tk.Label(self, bg=BG, anchor="nw")
+        self.lbl.pack(fill="both", expand=True, padx=10, pady=10)
+        for v in (self.text, self.size):
+            v.trace_add("write", lambda *_: self.after_idle(self.draw))
+        self.bind("<Configure>", lambda e: self.after_idle(self.draw))
+        self.draw()
+
+    def draw(self):
+        W = max(self.winfo_width() - 20, 400)
+        s, t = self.size.get(), self.text.get() or "Aa"
+        rows = []
+        for fi in self.fonts:
+            im = Image.new("RGB", (W, int(s * 1.6) + 26), self.app.pbg())
+            d = ImageDraw.Draw(im)
+            d.text((0, 2), fi.name, fill=MUTED)
+            try:
+                d.text((0, 20), t, font=ImageFont.truetype(fi.path, s), fill=self.app.pfg())
+            except Exception:
+                pass
+            rows.append(im)
+        full = Image.new("RGB", (W, sum(r.height + 8 for r in rows)), BG)
+        y = 0
+        for r in rows:
+            full.paste(r, (0, y))
+            y += r.height + 8
+        self._img = ImageTk.PhotoImage(full)
+        self.lbl.config(image=self._img)
+
+
+class QuickSort(Win):
+    """← jeter · → garder · ↑ favori · Retour arrière = annuler."""
+
+    def __init__(self, app, fonts):
+        super().__init__(app, "Tri rapide", "1000x560")
+        self.fonts, self.i, self.hist, self.trash = fonts, 0, [], []
+        self.info = tk.Label(self, bg=BG, fg=MUTED, font=("Segoe UI", 11))
+        self.info.pack(pady=(10, 0))
+        self.title_l = tk.Label(self, bg=BG, fg=FG, font=("Segoe UI", 16, "bold"))
+        self.title_l.pack()
+        self.img = tk.Label(self, bg=BG)
+        self.img.pack(fill="both", expand=True, padx=20)
+        tk.Label(self, bg=BG, fg=MUTED, font=("Segoe UI", 11),
+                 text="←  jeter      →  garder      ↑  favori      ⌫  annuler      Échap  terminer").pack(pady=10)
+        self.bind("<Left>", lambda e: self.act("trash"))
+        self.bind("<Right>", lambda e: self.act("keep"))
+        self.bind("<Up>", lambda e: self.act("fav"))
+        self.bind("<BackSpace>", lambda e: self.undo())
+        self.bind("<Escape>", lambda e: self.finish())
+        self.protocol("WM_DELETE_WINDOW", self.finish)
+        self.focus_force()
+        self.show()
+
+    def show(self):
+        if self.i >= len(self.fonts):
+            return self.finish()
+        fi = self.fonts[self.i]
+        lock = "  🔒 protégée" if is_protected(fi.family, fi.user) else ""
+        self.info.config(text=f"{self.i + 1} / {len(self.fonts)}  ·  {len(self.trash)} à jeter")
+        self.title_l.config(text=fi.name + ("  ⭐" if self.app.is_fav(fi) else "") + lock)
+        W = 940
+        im = Image.new("RGB", (W, 380), self.app.pbg())
+        d = ImageDraw.Draw(im)
+        try:
+            y = 0
+            for s, t in ((72, "Aa Bb Cc 123"), (40, self.app.sample.get() or "Aa"), (22, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+                         (22, "abcdefghijklmnopqrstuvwxyz 0123456789 àéèç&@€")):
+                d.text((0, y), t, font=ImageFont.truetype(fi.path, s), fill=self.app.pfg())
+                y += int(s * 1.5)
+        except Exception as e:
+            d.text((0, 0), str(e), fill="#a00")
+        self._img = ImageTk.PhotoImage(im)
+        self.img.config(image=self._img)
+
+    def act(self, what):
+        if self.i >= len(self.fonts):
+            return
+        fi = self.fonts[self.i]
+        self.hist.append((what, fi))
+        if what == "trash":
+            self.trash.append(fi)
+        elif what == "fav" and not self.app.is_fav(fi):
+            self.app.cfg["favorites"].append(fi.path)
+        self.i += 1
+        self.show()
+
+    def undo(self):
+        if not self.hist:
+            return
+        what, fi = self.hist.pop()
+        if what == "trash":
+            self.trash.remove(fi)
+        elif what == "fav" and fi.path in self.app.cfg["favorites"]:
+            self.app.cfg["favorites"].remove(fi.path)
+        self.i -= 1
+        self.show()
+
+    def finish(self):
+        self.app.save_cfg()
+        trash = self.trash
+        self.destroy()
+        self.app.draw()
+        if trash:
+            self.app.uninstall_sel(trash)
+
+
+class CharMap(Win):
+    CELL, COLS, PER_PAGE = 52, 16, 16 * 10
+
+    def __init__(self, app, fi):
+        super().__init__(app, f"Caractères — {fi.name}", f"{16 * 52 + 30}x680")
+        self.fi, self.chars, self.page = fi, font_chars(fi.path), 0
+        bar = tk.Frame(self, bg=BAR, padx=10, pady=6)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="◀", width=3, command=lambda: self.go(-1)).pack(side="left")
+        ttk.Button(bar, text="▶", width=3, command=lambda: self.go(1)).pack(side="left", padx=4)
+        self.info = tk.Label(bar, bg=BAR, fg=FG)
+        self.info.pack(side="left", padx=10)
+        self.cv = tk.Canvas(self, bg=self.app.pbg(), highlightthickness=0)
+        self.cv.pack(fill="both", expand=True, padx=10, pady=10)
+        self.cv.bind("<Button-1>", self.click)
+        self.bind("<MouseWheel>", lambda e: self.go(-1 if e.delta > 0 else 1))
+        self.draw()
+
+    def go(self, d):
+        last = max(0, (len(self.chars) - 1) // self.PER_PAGE)
+        self.page = max(0, min(last, self.page + d))
+        self.draw()
+
+    def draw(self):
+        C = self.CELL
+        part = self.chars[self.page * self.PER_PAGE:(self.page + 1) * self.PER_PAGE]
+        rows = max(1, (len(part) + self.COLS - 1) // self.COLS)
+        im = Image.new("RGB", (self.COLS * C, rows * C), self.app.pbg())
+        d = ImageDraw.Draw(im)
+        try:
+            font = ImageFont.truetype(self.fi.path, 28)
+        except Exception:
+            font = None
+        for k, cp in enumerate(part):
+            x, y = (k % self.COLS) * C, (k // self.COLS) * C
+            d.rectangle((x, y, x + C - 1, y + C - 1), outline=LINE)
+            if font:
+                d.text((x + C / 2, y + C / 2 - 4), chr(cp), font=font, fill=self.app.pfg(), anchor="mm")
+            d.text((x + 3, y + C - 12), f"{cp:04X}", fill=MUTED)
+        self._img = ImageTk.PhotoImage(im)
+        self.cv.delete("all")
+        self.cv.create_image(0, 0, anchor="nw", image=self._img)
+        pages = max(1, (len(self.chars) + self.PER_PAGE - 1) // self.PER_PAGE)
+        self.info.config(text=f"{len(self.chars)} caractères · page {self.page + 1}/{pages} · clic = copier")
+
+    def click(self, e):
+        k = self.page * self.PER_PAGE + (e.y // self.CELL) * self.COLS + e.x // self.CELL
+        if e.x < self.COLS * self.CELL and 0 <= k < len(self.chars):
+            ch = chr(self.chars[k])
+            self.clipboard_clear()
+            self.clipboard_append(ch)
+            self.info.config(text=f"« {ch} » (U+{self.chars[k]:04X}) copié dans le presse-papiers")
+
+
+class TrashDialog(Win):
+    def __init__(self, app):
+        super().__init__(app, "Corbeille", "560x420")
+        tk.Label(self, text="Polices désinstallées. Restaurer = réinstaller pour vous.",
+                 bg=BG, fg=MUTED).pack(anchor="w", padx=12, pady=(10, 4))
+        self.lb = tk.Listbox(self, selectmode="extended", bg=FIELD, fg=FG, selectbackground=ACC,
+                             highlightthickness=0, borderwidth=0, font=("Segoe UI", 10))
+        self.lb.pack(fill="both", expand=True, padx=12)
+        b = tk.Frame(self, bg=BG)
+        b.pack(fill="x", padx=12, pady=10)
+        ttk.Button(b, text="♻ Restaurer", style="Accent.TButton", command=self.restore).pack(side="left")
+        ttk.Button(b, text="Supprimer définitivement", command=self.purge).pack(side="left", padx=6)
+        ttk.Button(b, text="Vider la corbeille", command=lambda: self.purge(all_=True)).pack(side="right")
+        self.fill()
+
+    def fill(self):
+        self.idx = trash_index()
+        self.keys = sorted(self.idx, reverse=True)
+        self.lb.delete(0, "end")
+        for k in self.keys:
+            self.lb.insert("end", f"{self.idx[k]['name']}   —   {self.idx[k]['date']}")
+        if not self.keys:
+            self.lb.insert("end", "(corbeille vide)")
+
+    def chosen(self):
+        return [self.keys[i] for i in self.lb.curselection() if i < len(self.keys)]
+
+    def restore(self):
+        done = []
+        for k in self.chosen():
+            try:
+                fi = restore_from_trash(k)
+                if fi:
+                    done.append(fi)
+            except Exception as e:
+                messagebox.showerror("Corbeille", f"{self.idx[k]['name']} : {e}", parent=self)
+        if done:
+            notify_font_change()
+            self.app.fonts += done
+            self.app.apply_filter()
+        self.fill()
+
+    def purge(self, all_=False):
+        keys = self.keys if all_ else self.chosen()
+        if keys and messagebox.askyesno("Corbeille", f"Supprimer définitivement {len(keys)} police(s) ?", parent=self):
+            empty_trash(keys)
+            self.fill()
+
+
 class InstallDialog(tk.Toplevel):
     """Aperçu des polices avant installation."""
 
@@ -692,7 +1189,7 @@ class InstallDialog(tk.Toplevel):
         msg = f"{len(items)} nouvelle(s) police(s) à installer."
         if dup:
             msg += f"  ({dup} déjà installée(s), ignorée(s))"
-        tk.Label(self, text=msg, bg=BG, font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=10)
+        tk.Label(self, text=msg, bg=BG, fg=FG, font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=10)
         frame = tk.Frame(self, bg=BG)
         frame.pack(fill="both", expand=True, padx=12)
         cv = tk.Canvas(frame, bg=BG, highlightthickness=0)
