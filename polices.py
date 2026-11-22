@@ -824,6 +824,23 @@ def create_shortcut(exe):
                    capture_output=True, creationflags=0x08000000)
 
 
+def recycle(path):
+    """Envoie un fichier à la corbeille de Windows (récupérable), ou le supprime ailleurs."""
+    if not IS_WIN:
+        os.remove(path)
+        return
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", ctypes.c_uint), ("pFrom", ctypes.c_wchar_p),
+                    ("pTo", ctypes.c_wchar_p), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", ctypes.c_wchar_p)]
+    # FO_DELETE, et FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+    op = SHFILEOPSTRUCTW(None, 3, os.path.abspath(path) + "\0", None, 0x40 | 0x10 | 0x4 | 0x400, False, None, None)
+    if ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) or op.fAnyOperationsAborted:
+        raise OSError("fichier en cours d'utilisation ou protégé")
+
+
 def find_7z():
     for p in (shutil.which("7z"), r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"):
         if p and os.path.exists(p):
@@ -1664,14 +1681,20 @@ class App(BaseTk):
         if paths:
             self.install_paths(list(paths))
 
-    def install_paths(self, paths):
+    def install_paths(self, paths, can_delete=True):
+        """Installe les polices de fichiers, archives ou dossiers.
+        can_delete : proposer d'envoyer les fichiers d'origine (pas les dossiers) à la corbeille de Windows."""
         tmp = tempfile.mkdtemp(prefix="polices_")
         try:
+            src_of = {}  # fichier police -> fichier d'origine (le zip, ou la police elle-même)
             try:
-                files = collect_fonts(paths, tmp)
+                for p in paths:
+                    for f in collect_fonts([p], tmp):
+                        src_of[f] = p
             except Exception as e:
                 messagebox.showerror("Erreur", str(e))
                 return
+            files = list(src_of)
             if not files:
                 messagebox.showinfo("Rien à installer", "Aucun fichier .ttf / .otf trouvé.")
                 return
@@ -1680,20 +1703,41 @@ class App(BaseTk):
             installed = {(x.family, x.style) for x in self.fonts}
             new = [(f, i) for f, i in infos if (i.family, i.style) not in installed]
             dup = len(infos) - len(new)
-            if not InstallDialog(self, new, dup).ok:
+            sources = sorted({src_of[f] for f, _ in infos if os.path.isfile(src_of[f])}) if can_delete else []
+            dlg = InstallDialog(self, new, dup, sources, self.cfg.get("delete_source", True))
+            if not dlg.ok:
                 return
-            done = []
+            self.cfg["delete_source"] = dlg.delete
+            self.save_cfg()
+            done, failed_src = [], set()
             for f, _ in new:
                 try:
                     fi = install_font(f)
                     if fi:
                         done.append(fi)
                 except Exception as e:
+                    failed_src.add(src_of[f])
                     messagebox.showerror("Erreur", f"{os.path.basename(f)} : {e}")
             notify_font_change()
             self.fonts += done
-            self.apply_filter()
-            messagebox.showinfo("Terminé", f"{len(done)} police(s) installée(s).")
+            self.apply_filter_keep()
+            msg = f"{len(done)} police(s) installée(s)."
+            if dlg.delete:  # seulement si tout ce qui venait de ce fichier est installé (ou l'était déjà)
+                gone, kept = [], []
+                for p in sources:
+                    if p in failed_src:
+                        kept.append(f"{os.path.basename(p)} : une police n'a pas pu être installée")
+                        continue
+                    try:
+                        recycle(p)
+                        gone.append(p)
+                    except Exception as e:
+                        kept.append(f"{os.path.basename(p)} : {e}")
+                if gone:
+                    msg += f"\n{len(gone)} fichier(s) d'origine envoyé(s) à la corbeille de Windows."
+                if kept:
+                    msg += "\n\nFichiers gardés :\n" + "\n".join(kept[:8])
+            messagebox.showinfo("Terminé", msg)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2555,7 +2599,7 @@ class FontSearch(Win):
         def done(paths):
             self.btn.state(["!disabled"])
             self.info.config(text="")
-            self.app.install_paths(paths)
+            self.app.install_paths(paths, can_delete=False)  # fichiers temporaires, supprimés juste après
             shutil.rmtree(tmp, ignore_errors=True)
             self.app.run_bg(lambda: self.entries, self.app.catalog_ready)  # le badge « en ligne » suit
             if self.winfo_exists():
@@ -2816,9 +2860,9 @@ class BrokenWindow(Win):
 class InstallDialog(tk.Toplevel):
     """Aperçu des polices avant installation."""
 
-    def __init__(self, app, items, dup):
+    def __init__(self, app, items, dup, sources=(), delete=True):
         super().__init__(app)
-        self.ok = False
+        self.ok, self.delete = False, False
         self.title("Installer des polices")
         self.geometry("620x520")
         self.configure(bg=BG)
@@ -2849,18 +2893,28 @@ class InstallDialog(tk.Toplevel):
             y += 62
         cv.configure(scrollregion=(0, 0, 560, y))
         cv.bind("<MouseWheel>", lambda e: cv.yview_scroll(-e.delta // 120, "units"))
+        self.del_var = tk.BooleanVar(value=delete)
+        if sources:
+            names = ", ".join(os.path.basename(p) for p in sources[:3]) + ("…" if len(sources) > 3 else "")
+            tk.Checkbutton(self, variable=self.del_var, bg=BG, fg=FG, selectcolor=FIELD, activebackground=BG,
+                           anchor="w", justify="left", wraplength=580,
+                           text=f"Après l'installation, envoyer le(s) fichier(s) d'origine à la corbeille de Windows "
+                                f"({names})").pack(fill="x", padx=12, pady=(8, 0))
         btns = tk.Frame(self, bg=BG)
         btns.pack(fill="x", padx=12, pady=10)
         ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
         b = ttk.Button(btns, text="Installer", style="Accent.TButton", command=self.accept)
         b.pack(side="right", padx=8)
-        if not items:
+        if not items and sources:  # tout est déjà installé : on peut juste ranger les fichiers d'origine
+            b.config(text="Envoyer les fichiers d'origine à la corbeille")
+            self.del_var.set(True)
+        elif not items:
             b.state(["disabled"])
         self.grab_set()
         self.wait_window()
 
     def accept(self):
-        self.ok = True
+        self.ok, self.delete = True, self.del_var.get()
         self.destroy()
 
 

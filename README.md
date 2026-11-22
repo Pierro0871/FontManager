@@ -99,3 +99,10 @@ Autres ajouts :
 - **Tri « Ajout récent »** et date d'installation dans le panneau de droite.
 - **Vue grille** : bouton ▦ Grille / ☰ Liste.
 - **Textes d'aperçu enregistrés** : liste déroulante, + pour enregistrer le texte en cours, − pour le retirer.
+
+## v1.13
+Après l'installation, les fichiers d'origine (zip, rar, 7z, ttf, otf) partent à la **corbeille de Windows**. Vous pouvez donc les récupérer.
+- Une case dans la fenêtre d'installation permet de garder les fichiers ; l'appli se souvient du choix.
+- Un fichier n'est jeté que si toutes ses polices sont installées, ou l'étaient déjà. Si une installation échoue, le fichier reste.
+- Les dossiers ne sont jamais supprimés.
+- Si tout est déjà installé, le bouton devient « Envoyer les fichiers d'origine à la corbeille ».
