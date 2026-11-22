@@ -36,11 +36,13 @@ if IS_WIN:
     USER_FONTS = os.path.join(os.environ["LOCALAPPDATA"], "Microsoft", "Windows", "Fonts")
     CONFIG = os.path.join(os.environ["APPDATA"], "GestionnairePolices.json")
     TRASH = os.path.join(os.environ["APPDATA"], "GestionnairePolices", "Corbeille")
+    WEBCACHE = os.path.join(os.environ["APPDATA"], "GestionnairePolices", "Web")
 else:  # pour tester sous Linux/Mac
     SYS_FONTS = "/usr/share/fonts"
     USER_FONTS = os.path.expanduser("~/.local/share/fonts")
     CONFIG = os.path.expanduser("~/.gestionnaire_polices.json")
     TRASH = os.path.expanduser("~/.gestionnaire_polices_corbeille")
+    WEBCACHE = os.path.expanduser("~/.gestionnaire_polices_web")
 
 # polices dont Windows a besoin : on refuse de les supprimer
 PROTECTED = ("segoe", "arial", "times new roman", "courier new", "calibri", "cambria", "candara",
@@ -262,6 +264,120 @@ def font_rights(path, user):
     return rights_category(txt, user)
 
 
+# ---------------------------------------------------------------- sites de polices
+FONTSOURCE = "https://api.fontsource.org/v1/fonts"
+SQUIRREL = "https://www.fontsquirrel.com/api"
+WEB_RIGHTS = {"OFL-1.1": "Libre (OFL, Apache…)", "Apache-2.0": "Libre (OFL, Apache…)",
+              "UFL-1.0": "Libre (OFL, Apache…)", "mit": "Libre (OFL, Apache…)",
+              "Unlicense": "Domaine public", "CC0-1.0": "Domaine public"}
+
+
+def norm(name):
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def http_get(url, timeout=20):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "GestionnairePolices"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read()
+        if r.status != 200 or not data:  # Font Squirrel répond parfois « 202 » vide (protection anti-robots)
+            raise OSError(f"réponse vide du site ({r.status})")
+        return data
+
+
+def catalog_entries(fontsource, squirrel):
+    """Liste unifiée des polices proposées par les sites, avec leurs droits."""
+    out = []
+    for x in fontsource:
+        out.append({"family": x["family"], "id": x["id"], "category": x.get("category", ""),
+                    "site": "Google Fonts" if x.get("type") == "google" else "Fontsource",
+                    "license": x.get("license", ""),
+                    "rights": WEB_RIGHTS.get(x.get("license", ""), "Libre (OFL, Apache…)")})
+    for x in squirrel:  # Font Squirrel ne liste que des polices autorisées en commercial
+        out.append({"family": x["family_name"], "id": x["family_urlname"], "category": x.get("classification", ""),
+                    "site": "Font Squirrel", "license": "Free for commercial use", "rights": "100% gratuite"})
+    return out
+
+
+def load_catalog(refresh=False):
+    """Catalogue gardé une semaine sur le disque, pour ne pas tout retélécharger."""
+    import time
+    path = os.path.join(WEBCACHE, "catalogue.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        if not refresh and time.time() - d["date"] < 7 * 86400:
+            return d["entries"]
+    except Exception:
+        d = None
+    old = d["entries"] if d else []
+    try:
+        fs = json.loads(http_get(FONTSOURCE))
+    except Exception:
+        if old:  # hors ligne : on garde l'ancien catalogue
+            return old
+        raise
+    try:
+        sq = json.loads(http_get(SQUIRREL + "/fontlist/all"))
+        entries = catalog_entries(fs, sq)
+    except Exception:  # Font Squirrel indisponible : Google Fonts seul, + l'ancienne liste Squirrel si on l'a
+        entries = catalog_entries(fs, []) + [e for e in old if e["site"] == "Font Squirrel"]
+    os.makedirs(WEBCACHE, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"date": time.time(), "entries": entries}, f, ensure_ascii=False)
+    return entries
+
+
+def web_lookup(entries):
+    """norm(famille) -> entrée ; Google Fonts passe avant Font Squirrel."""
+    idx = {}
+    for e in entries:
+        idx.setdefault(norm(e["family"]), e)
+    return idx
+
+
+def download_family(e, dest):
+    """Télécharge tous les styles d'une famille dans dest ; renvoie les chemins (fichiers ou zip)."""
+    os.makedirs(dest, exist_ok=True)
+    if e["site"] == "Font Squirrel":
+        p = os.path.join(dest, e["id"] + ".zip")
+        with open(p, "wb") as f:
+            f.write(http_get(f"https://www.fontsquirrel.com/fonts/download/{e['id']}", timeout=60))
+        return [p]
+    info = json.loads(http_get(f"{FONTSOURCE}/{e['id']}"))
+    sub = info.get("defSubset", "latin")
+    out = []
+    for w in info.get("weights", [400]):
+        for st in info.get("styles", ["normal"]):
+            p = os.path.join(dest, f"{e['id']}-{w}-{st}.ttf")
+            with open(p, "wb") as f:
+                f.write(http_get(f"https://cdn.jsdelivr.net/fontsource/fonts/{e['id']}@latest/{sub}-{w}-{st}.ttf"))
+            out.append(p)
+    return out
+
+
+def preview_source(e):
+    """Fichier pour l'aperçu : une police (Fontsource) ou une image (Font Squirrel), gardé en cache."""
+    os.makedirs(os.path.join(WEBCACHE, "apercus"), exist_ok=True)
+    base = os.path.join(WEBCACHE, "apercus", norm(e["site"]) + "_" + e["id"])
+    if e["site"] == "Font Squirrel":
+        if not os.path.exists(base + ".png"):
+            info = json.loads(http_get(f"{SQUIRREL}/familyinfo/{e['id']}"))
+            reg = next((x for x in info if x.get("style_name", "").lower() in ("regular", "normal", "book")), info[0])
+            with open(base + ".png", "wb") as f:
+                f.write(http_get(reg["listing_image"].replace("\\/", "/")))
+        return base + ".png"
+    if not os.path.exists(base + ".ttf"):
+        info = json.loads(http_get(f"{FONTSOURCE}/{e['id']}"))
+        w = 400 if 400 in info.get("weights", []) else info["weights"][0]
+        st = "normal" if "normal" in info.get("styles", []) else info["styles"][0]
+        with open(base + ".ttf", "wb") as f:
+            f.write(http_get(f"https://cdn.jsdelivr.net/fontsource/fonts/{e['id']}@latest/"
+                             f"{info.get('defSubset', 'latin')}-{w}-{st}.ttf"))
+    return base + ".ttf"
+
+
 def font_license(path):
     """Auteur, licence et droits d'intégration lus dans la police."""
     try:
@@ -341,13 +457,14 @@ def empty_trash(keys):
 
 # ---------------------------------------------------------------- polices
 class FontInfo:
-    __slots__ = ("path", "family", "style", "user", "ext", "tags", "rights")
+    __slots__ = ("path", "family", "style", "user", "ext", "tags", "rights", "web")
 
     def __init__(self, path, family, style, user):
         self.path, self.family, self.style, self.user = path, family, style, user
         self.ext = os.path.splitext(path)[1].lower()
         self.tags = set()
         self.rights = "Inconnue"
+        self.web = ""   # site où les droits ont été vérifiés
 
     @property
     def name(self):
@@ -594,7 +711,7 @@ class App(BaseTk):
         top.pack(fill="x")
         ttk.Button(top, text="➕ Installer des polices…", style="Accent.TButton",
                    command=self.ask_install).pack(side="left")
-        for txt, cmd in (("⭐ Favori", self.toggle_fav),
+        for txt, cmd in (("🌐 Trouver des polices", self.font_search), ("⭐ Favori", self.toggle_fav),
                          ("⚖ Comparer", self.compare), ("⚡ Tri rapide", self.quick_sort),
                          ("🗑 Désinstaller", self.uninstall_sel), ("♻ Corbeille", self.trash_dialog),
                          ("💾 Exporter", self.export_sel), ("📂", self.open_folder), ("⟳", self.reload)):
@@ -698,7 +815,58 @@ class App(BaseTk):
         self.fonts = fonts
         self.cache.clear()
         self.sel.clear()
+        self.apply_web_rights()
         self.apply_filter()
+        self.run_bg(load_catalog, self.catalog_ready, lambda e: None)  # vérif en ligne, en silence
+
+    def run_bg(self, work, done, fail=None):
+        """Lance work() dans un thread ; done(résultat) ou fail(erreur) s'exécutent dans la boucle Tk."""
+        box = []
+        def target():
+            try:
+                box.append((True, work()))
+            except Exception as e:
+                box.append((False, e))
+        threading.Thread(target=target, daemon=True).start()
+        def poll():
+            if not box:
+                return self.after(150, poll)
+            ok, res = box[0]
+            if ok:
+                done(res)
+            elif fail:
+                fail(res)
+            else:
+                messagebox.showerror("Internet", f"Impossible de joindre le site :\n{res}")
+        poll()
+
+    def catalog_ready(self, entries):
+        self.catalog = entries
+        idx = web_lookup(entries)
+        found = {}
+        for x in self.fonts:
+            if x.user:
+                e = idx.get(norm(x.family))
+                if e:
+                    found[norm(x.family)] = [e["rights"], e["site"], e["id"]]
+        self.cfg["web_rights"] = found
+        self.save_cfg()
+        before = [(x.rights, x.web) for x in self.fonts]
+        self.apply_web_rights()
+        if before != [(x.rights, x.web) for x in self.fonts]:
+            self.cache.clear()
+            self.apply_filter_keep()
+
+    def apply_web_rights(self):
+        """Les droits trouvés en ligne remplacent ceux devinés depuis le fichier."""
+        web = self.cfg.get("web_rights", {})
+        for x in self.fonts:
+            hit = web.get(norm(x.family)) if x.user else None
+            if hit:
+                x.rights, x.web = hit[0], hit[1]
+
+    def font_search(self):
+        FontSearch(self)
 
     def apply_filter(self):
         q = self.search.get().lower().strip()
@@ -830,7 +998,8 @@ class App(BaseTk):
             t = c.create_text(x0, y + 6, anchor="nw", text=label, fill=MUTED, font=("Segoe UI", 9))
             px = c.bbox(t)[2] + 14
             rc = RIGHTS_COLOR.get(row.rep.rights, MUTED)  # badge des droits, façon DaFont
-            bt = c.create_text(px + 6, y + 6, anchor="nw", text=row.rep.rights, fill=text_on(rc),
+            bt = c.create_text(px + 6, y + 6, anchor="nw", fill=text_on(rc),
+                               text=row.rep.rights + ("  ✓ en ligne" if row.rep.web else ""),
                                font=("Segoe UI", 8, "bold"))
             bx = c.bbox(bt)
             bg_ = c.create_rectangle(bx[0] - 6, bx[1] - 1, bx[2] + 6, bx[3] + 1, fill=rc, width=0)
@@ -870,6 +1039,7 @@ class App(BaseTk):
                                 f"Style : {', '.join(sorted(fi.tags)) or '?'}\n{fi.path}")
         lic = font_license(fi.path)
         self.d_lic.config(text=f"Droits : {fi.rights}. {RIGHTS_HELP.get(fi.rights, '')}\n"
+                               + (f"Vérifié en ligne sur {fi.web}.\n" if fi.web else "")
                                + "\n".join(f"{k} : {v[:160]}" for k, v in lic.items()),
                           fg=FG)
         W = 360
@@ -1758,6 +1928,150 @@ class TrashDialog(Win):
         if keys and messagebox.askyesno("Corbeille", f"Supprimer définitivement {len(keys)} police(s) ?", parent=self):
             empty_trash(keys)
             self.fill()
+
+
+class FontSearch(Win):
+    """Chercher et installer des polices de Google Fonts et Font Squirrel."""
+
+    def __init__(self, app):
+        super().__init__(app, "Trouver des polices", "1100x680")
+        self.entries, self.shown, self.cur = getattr(app, "catalog", None), [], None
+        bar = tk.Frame(self, bg=BAR, padx=10, pady=8)
+        bar.pack(fill="x")
+        self.q = tk.StringVar()
+        e = ttk.Entry(bar, textvariable=self.q, width=34)
+        e.pack(side="left")
+        e.focus_set()
+        self.g, self.s = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
+        for txt, var in (("Google Fonts", self.g), ("Font Squirrel", self.s)):
+            tk.Checkbutton(bar, text=txt, variable=var, bg=BAR, fg=FG, selectcolor=FIELD, activebackground=BAR,
+                           command=self.search).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="Chercher sur DaFont", command=self.dafont).pack(side="right")
+        self.info = tk.Label(bar, bg=BAR, fg=MUTED)
+        self.info.pack(side="right", padx=12)
+
+        body = tk.PanedWindow(self, orient="horizontal", sashwidth=5, bg=LINE)
+        body.pack(fill="both", expand=True)
+        left = tk.Frame(body, bg=BG)
+        st = ttk.Style(self)
+        st.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=FG, rowheight=26)
+        st.configure("Treeview.Heading", background=BAR, foreground=FG)
+        self.tree = ttk.Treeview(left, columns=("site", "style", "droits", "ici"), show="tree headings")
+        for col, txt, w in (("#0", "Police", 230), ("site", "Site", 110), ("style", "Style", 100),
+                            ("droits", "Droits", 150), ("ici", "", 70)):
+            self.tree.heading(col, text=txt)
+            self.tree.column(col, width=w, stretch=col == "#0")
+        sb = ttk.Scrollbar(left, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True)
+        body.add(left, minsize=500, stretch="always")
+        right = tk.Frame(body, bg=BG, padx=12, pady=10)
+        self.p_title = tk.Label(right, bg=BG, fg=FG, font=("Segoe UI", 14, "bold"), anchor="w")
+        self.p_title.pack(fill="x")
+        self.p_info = tk.Label(right, bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=380)
+        self.p_info.pack(fill="x", pady=(2, 8))
+        self.p_img = tk.Label(right, bg=BG, anchor="nw")
+        self.p_img.pack(fill="both", expand=True)
+        self.btn = ttk.Button(right, text="Installer cette famille", style="Accent.TButton", command=self.install)
+        self.btn.pack(anchor="w", pady=8)
+        self.btn.state(["disabled"])
+        body.add(right, minsize=380, width=420)
+
+        self.q.trace_add("write", lambda *_: self.after_idle(self.search))
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.select())
+        if self.entries is None:
+            self.info.config(text="Chargement du catalogue…")
+            app.run_bg(load_catalog, self.got_catalog, lambda err: self.info.config(
+                text=f"Pas de connexion ({err.__class__.__name__}). Réessayez plus tard."))
+        else:
+            self.search()
+
+    def got_catalog(self, entries):
+        if not self.winfo_exists():
+            return
+        self.entries = self.app.catalog = entries
+        self.search()
+
+    def search(self):
+        if self.entries is None:
+            return
+        q = norm(self.q.get())
+        sites = {"Google Fonts", "Fontsource"} if self.g.get() else set()
+        if self.s.get():
+            sites.add("Font Squirrel")
+        res = [e for e in self.entries if e["site"] in sites and (not q or q in norm(e["family"]))]
+        res.sort(key=lambda e: (not norm(e["family"]).startswith(q), e["family"].lower()))
+        here = {norm(x.family) for x in self.app.fonts}
+        self.tree.delete(*self.tree.get_children())
+        self.shown = res[:400]
+        for i, e in enumerate(self.shown):
+            self.tree.insert("", "end", iid=str(i), text=e["family"],
+                             values=(e["site"], e["category"], e["rights"], "installée" if norm(e["family"]) in here else ""))
+        msg = f"{len(res)} résultat(s)" + (", 400 affichés" if len(res) > 400 else "")
+        if self.s.get() and not any(e["site"] == "Font Squirrel" for e in self.entries):
+            msg += ". Font Squirrel ne répond pas pour l'instant"
+        self.info.config(text=msg)
+
+    def select(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        e = self.cur = self.shown[int(sel[0])]
+        self.p_title.config(text=e["family"])
+        self.p_info.config(text=f"{e['site']}, {e['category']}\nDroits : {e['rights']}. {RIGHTS_HELP.get(e['rights'], '')}\n"
+                                f"Licence : {e['license']}\n\nChargement de l'aperçu…")
+        self.btn.state(["!disabled"])
+        self.app.run_bg(lambda: preview_source(e), lambda p: self.show_preview(e, p),
+                        lambda err: self.p_info.config(text=self.p_info.cget("text").replace("Chargement de l'aperçu…",
+                                                                                              f"Aperçu indisponible : {err}")))
+
+    def show_preview(self, e, path):
+        if e is not self.cur or not self.winfo_exists():
+            return
+        W = 380
+        if path.endswith(".png"):
+            im = Image.open(path).convert("RGBA")
+            im.thumbnail((W, 200))
+            bg = Image.new("RGBA", im.size, "#ffffff")
+            im = Image.alpha_composite(bg, im)
+        else:
+            im = Image.new("RGB", (W, 330), self.app.pbg())
+            d = ImageDraw.Draw(im)
+            y = 0
+            for s, t in ((52, "Aa Bb Cc"), (28, self.app.sample.get() or e["family"]), (20, "ABCDEFGHIJKLM"),
+                         (20, "abcdefghijklm 0123456789"), (20, "àéèçù &@€ ?!«»")):
+                d.text((0, y), t, font=ImageFont.truetype(path, s), fill=self.app.pfg())
+                y += int(s * 1.5)
+        self._img = ImageTk.PhotoImage(im)
+        self.p_img.config(image=self._img)
+        self.p_info.config(text=self.p_info.cget("text").replace("\n\nChargement de l'aperçu…", ""))
+
+    def install(self):
+        e = self.cur
+        if not e:
+            return
+        self.btn.state(["disabled"])
+        self.info.config(text=f"Téléchargement de {e['family']}…")
+        tmp = tempfile.mkdtemp(prefix="web_")
+        def done(paths):
+            self.btn.state(["!disabled"])
+            self.info.config(text="")
+            self.app.install_paths(paths)
+            shutil.rmtree(tmp, ignore_errors=True)
+            self.app.run_bg(lambda: self.entries, self.app.catalog_ready)  # le badge « en ligne » suit
+            if self.winfo_exists():
+                self.search()
+        def fail(err):
+            self.btn.state(["!disabled"])
+            self.info.config(text="")
+            messagebox.showerror("Téléchargement", f"{e['family']} : {err}", parent=self)
+        self.app.run_bg(lambda: download_family(e, tmp), done, fail)
+
+    def dafont(self):
+        import urllib.parse
+        import webbrowser
+        webbrowser.open("https://www.dafont.com/search.php?q=" + urllib.parse.quote(self.q.get().strip()))
 
 
 class InstallDialog(tk.Toplevel):

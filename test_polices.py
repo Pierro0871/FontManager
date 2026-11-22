@@ -73,3 +73,15 @@ assert rc("© Microsoft Corporation", user=True) == "Inconnue"
 assert rc("") == "Inconnue"
 assert all(r in p.RIGHTS_ORDER for r in ("Démo", "Inconnue"))
 print("ok droits")
+
+# sites de polices (sans réseau)
+cat = p.catalog_entries(
+    [{"family": "Roboto", "id": "roboto", "category": "sans-serif", "license": "OFL-1.1", "type": "google"},
+     {"family": "Free Thing", "id": "ft", "license": "CC0-1.0", "type": "other"}],
+    [{"family_name": "Roboto", "family_urlname": "roboto", "classification": "Sans Serif"},
+     {"family_name": "Lobster Two", "family_urlname": "lobster-two", "classification": "Script"}])
+idx = p.web_lookup(cat)
+assert idx["roboto"]["site"] == "Google Fonts"  # Google passe avant Squirrel
+assert idx["freething"]["rights"] == "Domaine public" and idx["freething"]["site"] == "Fontsource"
+assert idx[p.norm("Lobster-Two")]["rights"] == "100% gratuite"
+print("ok web")

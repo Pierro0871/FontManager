@@ -72,3 +72,14 @@ Le classement est deviné à partir du texte de licence rangé dans le fichier. 
 ## v1.10
 - Les polices de Windows sont cachées par défaut. Cochez « Polices Windows » pour les revoir. Le filtre « Système » les montre toujours.
 - Après une désinstallation, la liste reste à sa place et la police suivante est sélectionnée.
+
+## Trouver des polices et vérifier leurs droits en ligne (v1.11)
+**🌐 Trouver des polices** ouvre une fenêtre de recherche :
+- une seule barre cherche à la fois dans Google Fonts (environ 2 000 familles, via Fontsource) et dans Font Squirrel ;
+- cliquez un résultat pour voir son aperçu, son site, son style et ses droits ;
+- « Installer cette famille » télécharge tous les styles et les installe ;
+- « Chercher sur DaFont » ouvre la recherche dans votre navigateur : téléchargez le zip, puis glissez-le dans l'appli. DaFont interdit les téléchargements automatiques, d'où ce passage par le navigateur.
+
+**Droits vérifiés en ligne** : au démarrage, l'appli compare vos polices au catalogue de Google Fonts et de Font Squirrel, en arrière-plan. Quand une police y figure, sa licence officielle remplace celle devinée depuis le fichier, et son badge affiche « ✓ en ligne ». Le catalogue est gardé une semaine sur le disque.
+
+Font Squirrel refuse parfois les logiciels (réponse vide). Dans ce cas, Google Fonts marche seul et la fenêtre le signale.
